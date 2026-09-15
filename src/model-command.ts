@@ -5,7 +5,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model';
 import { TuiController } from './controller.js';
 
 /** The same mutable selection drives both prompt assembly and the visible footer. */
-export function registerModel(ctx: Context, selection: ModelSelectionRef, controller: TuiController): void {
+export function registerModel(ctx: Context, selection: ModelSelectionRef, controller: TuiController, workspace: string): void {
   ctx.commands.register({
     name: 'model', description: 'Choose a model for this session', input: { hint: '[provider/model]' },
     async handler({ agent, rawInput, signal }) {
@@ -20,7 +20,10 @@ export function registerModel(ctx: Context, selection: ModelSelectionRef, contro
         const entries = await catalog(ctx, signal);
         signal.throwIfAborted();
         if (!entries.length) return { kind: 'error', text: 'No models advertised. Use /model provider/model for an exact model ID.' };
-        const choice = await controller.picker.open(entries, signal);
+        const choice = await controller.picker.open(entries, {
+          title: 'Select model', hint: 'Enter choose · Ctrl+S save globally · Esc cancel',
+          empty: 'No matching models', allowSave: true,
+        }, signal);
         if (!choice) return { kind: 'success', text: 'Model selection cancelled.' };
         value = choice.value;
         save = choice.save;
@@ -37,7 +40,7 @@ export function registerModel(ctx: Context, selection: ModelSelectionRef, contro
       };
       if (save) await ctx.agentDefaultModel.saveSelection(next);
       selection.current = next;
-      controller.identity(provider, model, process.cwd());
+      controller.identity(provider, model, workspace, next.reasoningEffort);
       return { kind: 'success', text: save ? `Saved default: ${provider}/${model} (all profiles)` : `Model: ${provider}/${model} (session only)` };
     },
   });

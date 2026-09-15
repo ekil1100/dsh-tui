@@ -3,6 +3,8 @@
   "version": "0.1.0-mvp.0",
   "description": "Inline terminal UI for DeepSeek Harness, powered by eye_declare",
   "type": "module",
+  "packageManager": "bun@1.4.0",
+  "trustedDependencies": ["@deepseek-ai/dsh-subprocess-local", "node-pty"],
   "license": "MIT",
   "engines": { "node": "^22.19.0 || >=24.0.0" },
   "exports": {
@@ -13,17 +15,22 @@
   "files": ["dist", "cordis.patch.yml", "native/Cargo.toml", "native/Cargo.lock", "native/build.rs", "native/src", "native/vendor", "scripts/build-native.mjs"],
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "scripts": {
-    "build": "tsc && npm run build:native",
-    "build:native": "node scripts/build-native.mjs",
+    "dev": "bun run build && bun run dsh --profile tui",
+    "build": "tsc && bun run build:native",
+    "build:native": "bun scripts/build-native.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "test:pty": "npm run build && node --test --test-concurrency=1 test/pty.mjs",
-    "test:install": "npm run build && node --test test/install.mjs",
+    "test:pty": "bun run build && node --test --test-concurrency=1 test/pty.mjs",
+    "test:install": "bun run build && node --test test/install.mjs",
     "install": "node scripts/build-native.mjs"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-agent-presets": "0.1.5-rc.2",
     "@deepseek-ai/dsh-code-runtime-worker-thread": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-cordis-host-runner": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-host-plugin-inventory": "0.1.5-rc.2",
     "@deepseek-ai/dsh-tool-ask-user": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-tool-subagent": "0.1.5-rc.2",
     "commander": "15.0.0",
     "strip-ansi": "7.1.2"
   },

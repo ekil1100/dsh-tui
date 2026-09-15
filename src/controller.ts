@@ -3,25 +3,35 @@ import type { CommandDescriptor } from '@deepseek-ai/dsh-commands';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import type { ToolDefinition, ToolResultView } from '@deepseek-ai/dsh-tools';
 import { cleanText, oneLine } from './display-text.js';
-import { ModelPicker } from './model-picker.js';
+import { Picker } from './picker.js';
 import { InteractionQueue, type Approval, type Questions } from './interactions.js';
 
 type Presenter = Pick<ToolDefinition, 'presentCall' | 'presentResult'>;
 export type TranscriptEntry = { kind: 'user' | 'assistant' | 'tool' | 'notice' | 'error'; text: string };
 type Block = TranscriptEntry & { done: boolean };
 
+function tokens(value: number): string {
+  const unit = value >= 1_000_000 ? 1_000_000 : value >= 1000 ? 1000 : 1;
+  return unit === 1 ? String(value) : (value / unit).toFixed(1).replace(/\.0$/, '') + (unit === 1000 ? 'k' : 'M');
+}
+
 /** Ordered, terminal-independent projection for one fresh session. */
 export class TuiController {
   private committed: TranscriptEntry[] = [];
   private model = '';
+  private effort = 'default';
   private cwd = '';
+  private preset = '';
+  private extensions = 0;
+  private usage?: { input: number; output: number; read: number; write: number };
   private commands: { name: string; description: string }[] = [];
   private nextSeq = 0;
   private active = '';
+  private activity: '' | 'thinking' | 'responding' = '';
   private textBlocks = new Map<number, string>();
   private commandActive = false;
   private interactions: InteractionQueue;
-  readonly picker: ModelPicker;
+  readonly picker: Picker;
   private announced: string | undefined;
   private mode: 'idle' | 'running' = 'idle';
   private pending: Block[] = [];
@@ -34,7 +44,7 @@ export class TuiController {
     history: readonly TranscriptEntry[] = [],
   ) {
     this.committed = [...history];
-    this.picker = new ModelPicker(changed);
+    this.picker = new Picker(changed);
     this.interactions = new InteractionQueue(() => {
       const prompt = this.interactions.current();
       if (prompt && prompt.id !== this.announced) this.notice(prompt.body);
@@ -48,9 +58,15 @@ export class TuiController {
   answer(id: string, text: string): void { this.interactions.answer(id, text); }
   closeInteractions(): void { this.interactions.close(); this.picker.close(); }
 
-  identity(provider: string, model: string, cwd: string): void {
-    this.model = oneLine(`${provider}/${model}`);
+  identity(provider: string, model: string, cwd: string, effort?: string): void {
+    this.model = oneLine(`(${provider}) ${model}`);
+    this.effort = oneLine(effort ?? 'default');
     this.cwd = oneLine(cwd);
+  }
+
+  composition(preset: string, extensions: number): void {
+    this.preset = oneLine(preset);
+    this.extensions = extensions;
   }
 
   catalog(commands: readonly CommandDescriptor[]): void {
@@ -65,9 +81,21 @@ export class TuiController {
   user(text: string): void { this.notice(`> ${text}`, 'user'); }
 
   stream(frame: AssistantStreamFrame): void {
-    if (frame.type === 'start') { this.active = ''; this.textBlocks.clear(); }
-    if (frame.type === 'chunk' && frame.chunk.type === 'text-delta') {
-      const { index, text } = frame.chunk;
+    if (frame.type === 'start') {
+      this.activity = '';
+      this.active = '';
+      this.textBlocks.clear();
+      return;
+    }
+    if (frame.type === 'end') { this.activity = ''; return; }
+    const chunk = frame.chunk;
+    if (chunk.type === 'block-start') {
+      this.activity = chunk.blockType === 'reasoning' ? 'thinking' : chunk.blockType === 'text' ? 'responding' : '';
+    }
+    if (chunk.type === 'reasoning-delta') this.activity = 'thinking';
+    if (chunk.type === 'text-delta') {
+      this.activity = 'responding';
+      const { index, text } = chunk;
       this.textBlocks.set(index, (this.textBlocks.get(index) ?? '') + text);
       this.active = [...this.textBlocks].sort(([left], [right]) => left - right).map(([, text]) => text).join('');
     }
@@ -78,11 +106,21 @@ export class TuiController {
     this.nextSeq++;
     switch (event.type) {
       case 'turn/start': this.mode = 'running'; break;
-      case 'assistant/message':
-        this.pending.push({ kind: 'assistant', done: true, text: event.data.message.content
-          .filter(block => block.type === 'text').map(block => block.text).join('') + (event.data.interrupted ? '\n[incomplete]' : '') });
+      case 'assistant/message': {
+        if (event.data.usage) {
+          const usage = event.data.usage;
+          this.usage ??= { input: 0, output: 0, read: 0, write: 0 };
+          this.usage.input += usage.inputTokens;
+          this.usage.output += usage.outputTokens;
+          this.usage.read += usage.cacheReadTokens ?? 0;
+          this.usage.write += usage.cacheWriteTokens ?? 0;
+        }
+        const text = event.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('');
+        this.pending.push({ kind: 'assistant', done: true, text: text && event.data.interrupted ? `${text}\n[incomplete]` : text });
         this.active = '';
+        this.activity = '';
         break;
+      }
       case 'tool/call': {
         const { name, arguments: raw, callId } = event.data;
         let args: unknown;
@@ -133,6 +171,7 @@ export class TuiController {
         }
         if (this.active) this.pending.push({ kind: 'assistant', done: true, text: `${this.active}\n[incomplete]` });
         this.active = '';
+        this.activity = '';
         if (reason.kind !== 'completed') {
           const text = reason.kind === 'aborted' ? 'Stopped.'
             : reason.kind === 'error' ? `Error: ${reason.error.code}: ${reason.error.message}`
@@ -151,10 +190,16 @@ export class TuiController {
 
   snapshot() {
     const prompt = this.interactions.current();
+    const usage = this.usage;
     return {
       committed: [...this.committed],
-      model: this.model, cwd: this.cwd, commands: this.commands, picker: this.picker.current,
+      model: this.model, effort: this.effort, cwd: this.cwd, preset: this.preset, extensions: this.extensions,
+      commands: this.commands, picker: this.picker.current,
+      stats: usage ? [`↑${tokens(usage.input)}`, `↓${tokens(usage.output)}`,
+        usage.read ? `R${tokens(usage.read)}` : '', usage.write ? `W${tokens(usage.write)}` : '',
+      ].filter(Boolean).join(' ') : '',
       active: cleanText([...this.pending.map(block => block.text), this.active].filter(Boolean).join('\n')),
+      activity: this.activity,
       mode: prompt ? 'interaction' as const : this.commandActive ? 'command' as const : this.mode,
       interaction: prompt ? { id: prompt.id, hint: oneLine(prompt.hint) } : null,
     };

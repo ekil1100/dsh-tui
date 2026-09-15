@@ -26,8 +26,8 @@ test('a packed bundle installs, parses help, rejects non-TTY startup, and cold-l
     assert.equal(result.status, 0, result.stderr + result.stdout);
     return result.stdout;
   };
-  const pack = JSON.parse(ok(run('npm', ['pack', '--json', '--pack-destination', home])))[0];
-  const archive = path.join(home, pack.filename);
+  const archive = path.join(home, 'dsh-tui.tgz');
+  ok(run('bun', ['pm', 'pack', '--filename', archive]));
   mkdirSync(profile, { recursive: true });
   writeFileSync(path.join(profile, 'package.json'), JSON.stringify({ private: true,
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'], patchReload: 'startup' } },
@@ -44,7 +44,7 @@ test('a packed bundle installs, parses help, rejects non-TTY startup, and cold-l
     assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@ekil9/dsh-tui']);
     const config = ok(run(process.execPath, [bin, '--profile', 'tui', '--dump-config']));
     assert.match(config, /tui-runner/);
-    assert.doesNotMatch(config, /name:.*(?:dsh-host|dsh-http-server|dsh-web-app|dsh-web-runtime)/);
+    assert.doesNotMatch(config, /name:.*(?:dsh-host|dsh-http-server|dsh-web-app|dsh-web-runtime)(?=['"\s]|$)/);
     const help = ok(run(process.execPath, [bin, '--profile', 'tui', '--help']));
     assert.match(help, /inline terminal session/);
     assert.doesNotMatch(help, /\x1b\[\?2004h/);
@@ -62,6 +62,8 @@ test('a packed bundle installs, parses help, rejects non-TTY startup, and cold-l
     ].join('\n'));
     const app = await startApp(t, { name: 'packed', command: `${JSON.stringify(process.execPath)} ${JSON.stringify(bin)} --profile tui`, env });
     await app.waitFor('dsh · test', 15000);
+    await app.input('/preset minimal\r');
+    await app.waitFor('Preset: minimal (session only)');
     await app.input('packed\r');
     await app.waitFor('Reply: packed');
     await app.input('/new\r');
@@ -79,6 +81,7 @@ test('a packed bundle installs, parses help, rejects non-TTY startup, and cold-l
       assert.equal(sessions.length, 2);
       const logs = [];
       for (const session of sessions) {
+        assert.equal(session.header.agentPreset, 'standard');
         const handle = await reader.sessionPersistence.open(session.header.id, 'read');
         try {
           const log = JSON.stringify((await handle.read()).events);
@@ -92,6 +95,9 @@ test('a packed bundle installs, parses help, rejects non-TTY startup, and cold-l
       assert.equal(current.length, 1);
       assert.doesNotMatch(previous[0], /Reply: fresh-session/);
       assert.doesNotMatch(current[0], /Reply: packed/);
+      assert.match(previous[0], /"type":"agent-preset\/selected"/);
+      assert.match(previous[0], /"agentPreset":"minimal"/);
+      assert.doesNotMatch(current[0], /agent-preset\/selected/);
     } finally { await reader.fiber.dispose(); }
   } finally {
     t.after(() => rmSync(home, { recursive: true, force: true }));

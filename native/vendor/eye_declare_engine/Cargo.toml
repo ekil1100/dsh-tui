@@ -32,6 +32,10 @@ name = "eye_declare_engine"
 path = "src/lib.rs"
 
 [[test]]
+name = "commit_scrollback"
+path = "tests/commit_scrollback.rs"
+
+[[test]]
 name = "resize_reflow"
 path = "tests/resize_reflow.rs"
 

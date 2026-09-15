@@ -6,22 +6,26 @@
 
 ## 本地启动
 
-需要 Node `^22.19.0 || >=24`、Rust ≥1.88、pnpm 和本机编译工具。当前验证环境为 macOS arm64、Node 24.14、Rust 1.98.1、pnpm 11.22。
+需要 Bun 1.4、Node `^22.19.0 || >=24`、Rust ≥1.88、pnpm 和本机编译工具。当前验证环境为 macOS arm64、Bun 1.4.0、Node 24.14、Rust 1.98.1、pnpm 11.22。
 
 ```sh
-npm ci
-npm run build
-npm exec -- dsh plugin --profile tui add "$PWD"
-npm exec -- dsh --profile tui
+bun install --frozen-lockfile
+bun run build
+bun run dsh plugin --profile tui add "$PWD"
+bun dev
 ```
 
-`npm exec -- dsh` 使用本项目锁定的 **dsh 0.1.5-rc.2**。接口包也锁定同一版本，不适配旧 dsh；如果使用全局 `dsh`，需自行确认版本一致。
+首次使用需要完成上面的依赖安装和 profile 注册。之后在仓库目录执行 `bun dev`，会先构建当前代码，再启动 `tui` profile；不自动重启运行中的会话。只想启动已有构建时，用 `bun run dsh --profile tui`。
+
+本仓库使用 Bun 管理依赖、构建命令和打包，只维护 `bun.lock`。`bun run dsh` 使用本项目锁定的 **dsh 0.1.5-rc.2**，并遵循其 Node shebang；不要加 `--bun` 强制更换宿主运行时。dsh 的 profile 仍由上游内置的 pnpm 管理，发布包的安装脚本也仍用 Node，不要求插件使用者额外安装 Bun。接口包锁定同一 dsh 版本，不适配旧 dsh；如果使用全局 `dsh`，需自行确认版本一致。
+
+Bun 的安装脚本白名单只包含 `node-pty` 和 `@deepseek-ai/dsh-subprocess-local`，用于准备 PTY 原生依赖及恢复 spawn-helper 执行权限。其他依赖的脚本保持拦截，不要全局放开 `trust --all`。
 
 模型与凭证沿用 dsh 自己的设置。`dsh-base` 原始默认模型为 `deepseek-flash`，但 `~/.dsh/settings.yaml` 中保存的 `agent-default-model` 优先；TUI 不会擅自覆盖共享设置。底栏显示实际选择的 provider/model，可用 `/model` 切换。例如已配置 `DEEPSEEK_API_KEY` 或 dsh 的凭证文件，就不需要为 TUI 再配置一份。未配置模型凭证时，界面仍能启动，提交后会显示模型错误。
 
 ```sh
-npm exec -- dsh --profile tui --help
-npm exec -- dsh --profile tui --dump-config
+bun run dsh --profile tui --help
+bun run dsh --profile tui --dump-config
 ```
 
 `tui` profile 由 `dsh-base` 后接本 bundle 组成。非 TTY 会明确失败，不切换成另一种运行模式。测试使用临时 `DSH_HOME`，不会修改你的实际 profile 或会话。
@@ -29,9 +33,9 @@ npm exec -- dsh --profile tui --dump-config
 ## 当前能力
 
 - 新建并持久化会话，连续多轮对话；`/new` 关闭旧会话后创建新上下文，不清除或重放终端历史。
-- pi 风格消息分层、输入分隔线、动态模型/状态/目录底栏；沿用当前终端的 ANSI 调色板，支持非空 `NO_COLOR`。
-- 流式阶段显示纯文本末尾预览，不显示 reasoning；最终回答按基础 Markdown 定稿一次：标题、强调、有序/无序列表、引用、行内代码和代码块。用户输入与工具/日志内容保持字面文本。
-- 回答和工具终态进入真实终端历史；底部活动区最多 4 行，命令/模型候选位于输入框下方、状态栏上方，不开启备用屏幕。
+- pi 风格双横线输入区：输入从行首开始，不显示 `>` 提示符；状态嵌在上横线。目录行左侧为目录/分支，右侧为当前 preset 与动态 extension 数；底栏左侧为用量/必要操作提示，右侧为模型/effort，空闲时不显示 `/help`。主色采用低饱和雾蓝，effort 使用 pi 的深色主题配色；保留终端背景和字体，支持非空 `NO_COLOR`。
+- 流式阶段显示纯文本末尾预览，不显示 reasoning；状态按真实事件区分 `Thinking`（思考）、`Responding`（正文输出）与 `Working`（等待/工具执行），完成后回到 `Idle`。最终回答按基础 Markdown 定稿一次：标题、强调、有序/无序列表、引用、行内代码和代码块。用户输入与工具/日志内容保持字面文本。仅在思考、尚无正文时取消，不生成空的 `[incomplete]`；已有正文则保留并标记未完成。
+- 回答和工具终态进入真实终端历史；普通活动区最多 8 行，打开菜单时最多 16 行。所有候选位于**输入框下横线之外、目录与底栏上方**，正常窗口最多显示 8 项，上下键滚动，标题显示当前序号/总数；不进入备用屏幕。短窗口按高度减少候选，优先保留输入与下横线，省略装饰行；窄窗口从左侧省略模型名，优先保留末尾的 effort。
 - 运行时仍可编辑输入；提交走 `steer()`，空闲提交走 `followup()`。
 - 工具运行、完成和失败摘要，使用工具提供的 presentation；缺失或出错时使用通用标题。终端类结果附带 exit code / signal，不展开完整工具输出。
 - Slash commands 走 dsh 命令服务，未知命令不会进入模型上下文；输入 `/` 从当前 Agent 的真实注册表列出命令，支持筛选、补全和键盘选择。
@@ -41,6 +45,26 @@ npm exec -- dsh --profile tui --dump-config
 - Node 的 stdout/stderr 写入统一经过安全文本投影，不直接打断输入行。
 - 正常退出、Ctrl+C、SIGINT、SIGTERM 后恢复原 shell，并 flush 会话、释放 Agent。
 
+### 界面与 effort 配色
+
+主色采用低饱和雾蓝 **`#8BA4E8`**，保留蓝色方向，但不直接使用官网高饱和品牌蓝；更适合深色终端里的长时间阅读。用于启动信息、默认输入边框、选中候选和 Markdown 标题/行内代码。目录、用量和模型底栏使用柔和灰色；不强制终端背景色。彩色模式面向支持 24 位 RGB 的终端。
+
+上下横线随**当前会话的已选 effort** 着色，色值对应 [pi 内置 dark 主题](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/interactive/theme/dark.json)：
+
+| Effort | 颜色 | 色值 |
+|---|---|---|
+| `off` / `none` | 深灰 | `#505050` |
+| `minimal` | 灰 | `#6E6E6E` |
+| `low` | 钢蓝 | `#5F87AF` |
+| `medium` | 浅蓝 | `#81A2BE` |
+| `high` | 淡紫 | `#B294BB` |
+| `xhigh` | 亮紫 | `#D183E8` |
+| `max` | 洋红 | `#FF5FFF` |
+
+未显式选择 effort 时显示 `default`，保留提供方默认行为，横线使用雾蓝主色；不把它误标成 `off`。其他 adapter 自定义 effort 保留原名、使用主色。本次只增加展示，不增加 effort 切换快捷键，也不会为了配色改写模型设置。不同模型切换时不沿用旧模型的 effort。
+
+目录在启动和 `/new` 时读取：home 前缀缩写为 `~`，Git 分支显示为 `(branch)`；非仓库或 detached HEAD 不伪造分支名。底栏的 `↑` 是未缓存输入 token，`↓` 是输出，`R`/`W` 是缓存读取/写入；只累计当前会话最终消息中 adapter 实际上报的 usage，不把流式 usage 重复加总，未上报且空闲时左侧留空。`/new` 清零用量。暂不显示费用、上下文占比或自动压缩状态，不使用示例数字冒充真实数据。
+
 ### 命令
 
 | 命令 | 行为 |
@@ -48,11 +72,21 @@ npm exec -- dsh --profile tui --dump-config
 | `/help` | 当前 Agent 可用命令与按键说明 |
 | `/model` | 显示当前/默认模型，打开可搜索的模型列表 |
 | `/model provider/model` | 验证并切换当前会话模型；省略 provider 时沿用当前 provider |
-| `/new` | 空闲时 flush 并释放旧 Agent，创建新会话；新会话使用已保存的默认模型 |
+| `/preset` / `/preset id` | 搜索或直接选择 Agent preset；只允许在首次对话前切换 |
+| `/extensions` / `/extensions filter` | 搜索当前会话动态扩展与宿主/Preset 插件；Enter 查看详情，只读 |
+| `/new` | 空闲时 flush 并释放旧 Agent，创建新会话；重新读取默认模型与 preset |
 
 `/model` 普通选择或直接参数切换**仅影响当前会话**。模型列表中 **Ctrl+S** 才会保存默认值，影响所有共用 dsh 设置的 profile；界面会明确提示。切换模型与底栏、实际请求共用同一个选择引用。运行中不能切模型或新建会话，请先停止工作。
 
-dsh 已有命令直接从注册表使用，不重新实现。
+dsh 已有命令直接从当前 Agent 的注册表使用，不重新实现；切换 preset 或动态扩展注册命令后，补全目录同步更新。
+
+### Preset 与 Extension
+
+- Preset 走上游 `agentPresets` 的发现、挂载和选择接口，实际改变工具、提示词与命令作用域。提供 `standard`、`minimal`、`ptc`、`cordis`，也会发现 `$DSH_HOME/.agent-presets/<id>/` 下的本地预设。未配置 `DSH_HOME` 时使用 `~/.dsh`。
+- 默认是 `standard`；已有 `agent-presets.default` 设置优先。`/preset` **不修改全局默认**，Ctrl+S 只适用于模型列表。首次对话后必须先 `/new`，不能给已有工具记录就地换一套配置。创建时的 preset 写入会话头，后续合法选择写入会话事件；不迁移或改写旧日志。
+- 工具等 Agent 层插件移入 preset，宿主保留注册表、模型路由、持久化和权限服务，避免新旧工具重复挂载。PTC 使用真实 `run_code` 工具集；Cordis 提供动态宿主扩展工具，**可以执行模型生成的宿主 JavaScript，信任级别等同 shell 访问**。
+- `/extensions` 读取动态扩展服务及 Loader/Preset 的真实清单，显示所属作用域、模块或插件 ID、包版本和状态；只展示元数据，不展示源码或配置正文，不提供安装、启动、停止、删除动作。`disabled`、`not loaded`、`active`、`defined`、`running`、`failed` 等状态不会混为“已加载”。目录行的 `extensions` 是**当前会话动态扩展定义数**，包含未运行的定义，不是全部插件数或运行数。
+- 动态 Host 扩展可通过 dsh 服务注册工具、命令；新增命令自动出现在补全中。浏览器 Client 扩展无法在终端渲染，当前会话的激活请求会明确拒绝，不挂起等待不存在的浏览器，也不自动授权。
 
 ### 按键
 
@@ -63,6 +97,8 @@ dsh 已有命令直接从注册表使用，不重新实现。
 | Agent 运行 | Enter 追加 steering；Esc / Ctrl+C 停止工作 |
 | 命令菜单 | 输入 `/` 筛选；上下选择；Tab 只补全；Enter 执行；Esc 关闭菜单并保留草稿 |
 | 模型列表 | 输入搜索；上下选择；Enter 仅本会话；Ctrl+S 保存默认；Esc 取消 |
+| Preset 列表 | 输入搜索；上下选择；Enter 仅本会话；Esc 取消 |
+| Extension 列表 | 输入搜索；上下选择；Enter 查看快照详情；Esc 关闭 |
 | 命令执行 | Esc / Ctrl+C 取消；不接收新提交，但可编辑下一条草稿 |
 | 审批 | `y` + Enter 允许一次；`n` 或空 Enter 拒绝 |
 | 问题 | 单选输入编号或自定义文本；多选输入逗号分隔编号；空 Enter 跳过 |
@@ -75,7 +111,7 @@ dsh 已有命令直接从注册表使用，不重新实现。
 
 渲染、布局、Markdown 与 grapheme 编辑仍使用现成框架，不是自写 renderer，但不是完全未修改的 eye_declare 0.7.1。`native/vendor/` 保留两份源码补丁：
 
-- [引擎补丁](native/vendor/eye_declare_engine/README.md)：修正光标行截断被误算为重排、高度缩小后重绘清空历史，以及输入框下方内容重排导致光标报告漂移、候选残留的问题。空间不足时只滚动补足缺少的行；无法确认重排时宁可少擦留残影，不多擦历史。
+- [引擎补丁](native/vendor/eye_declare_engine/README.md)：修正光标行截断被误算为重排、高度缩小后重绘清空历史，以及输入框下方内容重排导致光标报告漂移、候选残留的问题。长回答写入滚动历史前逐行清除旧活动区内容，避免空行/短行夹带预览和状态栏。空间不足时只滚动补足缺少的行；无法确认重排时宁可少擦留残影，不多擦历史。
 - [Markdown 补丁](native/vendor/eye_declare/README.md)：补齐引用、编号列表与列表标记的无色样式。
 
 原始失败用例和两类光标行 reflow 设置均保留。未隐藏硬件光标、未进入备用屏幕、未重打已定稿内容。
@@ -86,36 +122,36 @@ dsh 已有命令直接从注册表使用，不重新实现。
 - 自动测试使用真实 PTY + headless xterm，不能替代所有真实终端和中文输入法候选窗的人工验收。复合 ZWJ emoji 的真实字形仍未验收。
 - Linux、Windows、原生进程崩溃等尚未做完整验证；不要把正常退出检查理解为任意强制终止都能恢复。
 - 输出协调覆盖 Node streams；绕过它们直接写终端 fd 的第三方插件尚不支持。
-- 没有会话选择/恢复、附件、多行编辑器、PTY 工具全屏接管或界面扩展接口；复杂 Markdown 表格与代码语法高亮未验收，流式预览暂不做 Markdown 排版。
+- 没有会话选择/恢复、附件、多行编辑器、PTY 工具全屏接管或自定义 TUI 组件扩展接口；复杂 Markdown 表格与代码语法高亮未验收，流式预览暂不做 Markdown 排版。
 - 原生模块目前在安装时从源码构建；还没有各平台预编译 npm 包，也没有发布到 npm。构建通过原子替换发布 `.node`，不原地改写已加载的动态库；重新构建后需要重启 dsh 才会使用新版界面。
 
 ## 打包安装
 
 ```sh
-npm run build
-npm pack
-npm exec -- dsh plugin --profile tui add "$PWD/ekil9-dsh-tui-0.1.0-mvp.0.tgz"
+bun run build
+bun pm pack --filename dsh-tui.tgz
+bun run dsh plugin --profile tui add "$PWD/dsh-tui.tgz"
 ```
 
 pnpm 可能阻止本地 tarball 的构建脚本。这时只批准本包，不要全局放开所有依赖脚本：
 
 ```sh
-npm exec -- dsh plugin --profile tui approve-builds
-npm exec -- dsh plugin --profile tui rebuild @ekil9/dsh-tui
-npm exec -- dsh plugin --profile tui install
+bun run dsh plugin --profile tui approve-builds
+bun run dsh plugin --profile tui rebuild @ekil9/dsh-tui
+bun run dsh plugin --profile tui install
 ```
 
 最后一次 `install` 让 launcher 同步 bundle 列表。pnpm 11 对本地 tarball 使用带 `@file:...` 的精确构建审批键；仅指定包名的 `--allow-build` 不一定足够。本仓库安装测试会在隔离 profile 中只批准被测 tarball。
 
 ## 开发与验证
 
-本机已通过：9 项 Controller 测试、30 项终端回归测试（含原生模块加载检查）、1 项打包安装/双会话冷读测试、106 项组件单元测试、64 项引擎测试，以及 TypeScript 与 Rust fmt/clippy 检查。测试 adapter 不调用真实模型 API。
+本机已通过：11 项 Controller 测试、45 项终端回归测试（含 7 个 effort、2 个 preset 子用例，共 54 项）、1 项打包安装/双会话与 preset 记录冷读测试、106 项组件单元测试、65 项引擎测试，以及 TypeScript 与 Rust fmt/clippy 检查。测试 adapter 不调用真实模型 API。
 
 ```sh
-npm test                    # Controller behavior tests
-npm run typecheck
-npm run test:pty             # Real launcher, Agent, tools, and terminal
-npm run test:install         # tarball installation and cold-read persistence across /new
+bun run test                # Controller behavior tests (Vitest)
+bun run typecheck
+bun run test:pty             # Real launcher, Agent, tools, and terminal
+bun run test:install         # Bun tarball installation and cold-read persistence across /new
 cargo fmt --manifest-path native/Cargo.toml --check
 cargo clippy --manifest-path native/Cargo.toml --locked -- -D warnings
 
@@ -125,6 +161,8 @@ cargo test --manifest-path native/vendor/eye_declare/Cargo.toml \
 cargo test --manifest-path native/vendor/eye_declare_engine/Cargo.toml \
   --features test-util --locked --target-dir native/target
 ```
+
+测试入口使用 `bun run test`，不使用会切换到 Bun 内置测试框架的 `bun test`。PTY 和安装测试保留 Node test runner，与 dsh 的正式宿主运行时一致。
 
 模型测试 adapter 只替换 LLM 系统边缘，不需要 API key；launcher、Cordis、Agent loop、工具、命令、审批、用户问题、持久化和原生终端走真实实现。没有据此宣称真实付费模型请求也已验收。
 
@@ -137,7 +175,9 @@ src/application.ts    Agent、事件、命令和完整关闭流程
 src/controller.ts     有序会话投影与界面快照
 src/commands.ts       /help 与命令说明
 src/model-command.ts  模型验证、会话切换和显式保存默认
-src/model-picker.ts   可取消且隔离过期答案的模型选择
+src/preset-command.ts Agent preset 的发现与合法选择
+src/extensions-command.ts 只读动态扩展与插件清单
+src/picker.ts         模型、Preset、Extension 共用的可取消选择器
 src/interactions.ts   审批/问题 FIFO
 src/terminal.ts       N-API 终端适配
 src/output.ts         Node 输出协调

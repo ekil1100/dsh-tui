@@ -11,6 +11,30 @@ function textView(controller: TuiController) {
   return { ...snapshot, committed: snapshot.committed.map(entry => entry.text) };
 }
 
+test('the footer projects the selected model and effort without inventing a provider default', () => {
+  const controller = new TuiController();
+  controller.identity('deepseek', 'deepseek-flash', '/workspace/project', 'high');
+  expect(controller.snapshot()).toMatchObject({ model: '(deepseek) deepseek-flash', effort: 'high', cwd: '/workspace/project' });
+  controller.identity('test', 'flash', '/workspace/project');
+  expect(controller.snapshot()).toMatchObject({ model: '(test) flash', effort: 'default' });
+});
+
+test('the footer totals only finalized reported usage and a new session starts without invented counts', () => {
+  const controller = new TuiController();
+  const session = Session.create('session-usage' as SessionId);
+  expect(controller.snapshot().stats).toBe('');
+  for (let step = 0; step < 2; step++) {
+    const usage = { inputTokens: 1000, outputTokens: 20, cacheReadTokens: 500, cacheWriteTokens: 75 };
+    controller.stream({ type: 'chunk', attemptId, revision: step + 1, index: step, time: 0, chunk: { type: 'usage', usage } });
+    controller.session(session.append('assistant/message', { turn: 0, step, stream: [], usage,
+      message: createAssistantMessage({ source: { provider: 'test', model: 'test' }, content: [{ type: 'text', text: 'Done.' }] }),
+    }, { surfaceOp: 'append' }));
+  }
+  expect(controller.snapshot().stats).toBe('↑2k ↓40 R1k W150');
+  const fresh = new TuiController(undefined, undefined, undefined, controller.snapshot().committed);
+  expect(fresh.snapshot().stats).toBe('');
+});
+
 test('two streamed fragments settle as one complete answer and return to ordinary input', () => {
   const controller = new TuiController();
   const session = Session.create('session-test' as SessionId);

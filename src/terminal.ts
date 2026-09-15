@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { oneLine } from './display-text.js';
-import type { PickerEvent } from './model-picker.js';
+import type { PickerEvent } from './picker.js';
 import type { TuiController } from './controller.js';
 
 export type TerminalEvent = PickerEvent | { type: 'submit'; text: string; interactionId: string | null } | { type: 'eof' | 'escape' | 'interrupt'; mode: Snapshot['mode'] };

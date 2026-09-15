@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { homedir } from 'node:os';
+import { sep } from 'node:path';
+import { promisify } from 'node:util';
 import type { Context } from '@deepseek-ai/cordis';
 import { installModelSelection, type AgentHandle, type ModelSelection } from '@deepseek-ai/dsh-agent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -13,9 +17,24 @@ import type {} from '@deepseek-ai/cordis-plugin-loader';
 import { TuiController, type TranscriptEntry } from './controller.js';
 import { registerHelp } from './commands.js';
 import { registerModel } from './model-command.js';
+import { registerPreset } from './preset-command.js';
+import { registerExtensions } from './extensions-command.js';
 import { captureOutput } from './output.js';
 import { cleanText, oneLine } from './display-text.js';
 import { createTerminal, type Terminal, type TerminalEvent } from './terminal.js';
+
+async function workspaceLabel(cwd: string, signal: AbortSignal): Promise<string> {
+  const home = homedir();
+  const directory = cwd === home ? '~' : cwd.startsWith(`${home}${sep}`) ? `~${cwd.slice(home.length)}` : cwd;
+  try {
+    const { stdout } = await promisify(execFile)('git', ['branch', '--show-current'], { cwd, signal, timeout: 1000 });
+    const branch = oneLine(stdout);
+    return branch ? `${directory} (${branch})` : directory;
+  } catch {
+    // Git is optional, and non-repository directories still have a usable path.
+    return directory;
+  }
+}
 
 /** Owns the terminal lifetime and serial transitions between owned Agent sessions. */
 export class TuiApplication {
@@ -36,6 +55,7 @@ export class TuiApplication {
   private commandTask?: Promise<void>;
   private restoreOutput?: () => string[];
   private closingLogs: string[] = [];
+  private workspace = process.cwd();
 
   constructor(private ctx: Context, private exit: (code: number) => void) {
     this.sessions = ctx.sessions;
@@ -55,7 +75,9 @@ export class TuiApplication {
 
   private async createAgent(): Promise<ModelSelection> {
     const selection = this.ctx.agentDefaultModel.currentSelection();
-    this.controller.identity(selection.provider, selection.model, process.cwd());
+    const preset = await this.ctx.agentPresets.resolve();
+    this.creation.signal.throwIfAborted();
+    this.controller.identity(selection.provider, selection.model, this.workspace, selection.reasoningEffort);
     const sessionId = `session-${randomUUID()}` as SessionId;
     this.sessionId = sessionId;
     const current = () => !this.stopped && this.sessionId === sessionId;
@@ -64,13 +86,16 @@ export class TuiApplication {
     }));
     this.handle = await this.ctx.agents.create({
       sessionId, signal: this.creation.signal,
-      meta: { cwd: process.cwd() },
+      meta: { cwd: process.cwd(), agentPreset: preset.id },
       agentOptions: { provider: selection.provider, model: selection.model },
-      setup: (agentCtx, agent) => {
+      setup: async (agentCtx, agent) => {
+        await this.ctx.agentPresets.mount(agentCtx, preset.id);
         const modelSelection = { current: selection, assembled: undefined };
-        agentCtx.inject(['commands', 'llm', 'agentDefaultModel'], commandCtx => {
+        agentCtx.inject(['commands', 'llm', 'agentDefaultModel', 'agentPresets', 'pluginInventory', 'dynamicCordisRunner'], commandCtx => {
           registerHelp(commandCtx);
-          registerModel(commandCtx, modelSelection, this.controller);
+          registerModel(commandCtx, modelSelection, this.controller, this.workspace);
+          registerPreset(commandCtx, this.controller);
+          registerExtensions(commandCtx, this.controller);
           commandCtx.commands.register({
             name: 'new', description: 'Start a new session',
             handler: ({ rawInput }) => {
@@ -101,12 +126,22 @@ export class TuiApplication {
   private async boot(): Promise<void> {
     await this.ctx.get('loader')?.await();
     if (this.stopped) return;
+    this.workspace = await workspaceLabel(process.cwd(), this.creation.signal);
+    if (this.stopped) return;
     const selection = await this.createAgent();
     if (this.stopped) return;
     this.disposers.push(this.ctx.on('commands/change', () => {
       if (!this.stopped && !this.transitioning && this.handle) {
         this.update(() => this.controller.catalog(this.ctx.commands.list(this.handle!.agent)));
       }
+    }));
+    this.disposers.push(this.ctx.on('cordis/request-run', request => {
+      if (request.agentId !== this.sessionId) return;
+      const message = 'Browser extensions are not supported in this TUI. Use a host-only extension.';
+      this.update(() => this.controller.notice(message, 'error'));
+      void this.ctx.dynamicCordisRunner.resolveRequestRun(request.requestId, {
+        ok: false, reason: 'rejected', message,
+      }).catch(error => this.fail(error));
     }));
     this.restoreOutput = captureOutput(line => {
       if (this.stopped) this.closingLogs.push(line);
@@ -137,6 +172,8 @@ export class TuiApplication {
     // Keep the append-only terminal timeline and its publication offset; reset only session state.
     this.controller = this.makeController(this.controller.snapshot().committed);
     this.controller.command(true);
+    this.workspace = await workspaceLabel(process.cwd(), this.creation.signal);
+    if (this.stopped) return;
     await this.createAgent();
     if (!this.stopped) this.controller.notice(`New session: ${this.sessionId}`);
   }
@@ -145,7 +182,11 @@ export class TuiApplication {
     if (this.stopped) return;
     try {
       action();
-      if (this.handle) this.controller.status(this.handle.agent.status);
+      if (this.handle) {
+        const agent = this.handle.agent;
+        this.controller.status(agent.status);
+        this.controller.composition(this.ctx.agentPresets.composedPreset(agent.ctx) ?? '', this.ctx.dynamicCordisRunner.listPlugins(agent).length);
+      }
       this.terminal?.render(this.controller.snapshot());
     } catch (error) { void this.fail(error); }
   }

@@ -11,7 +11,10 @@ import unicode11 from '@xterm/addon-unicode11';
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 
-export async function startDsh(t, name = 'dsh', { reflowCursorLine = false, env = {} } = {}) {
+export async function startDsh(t, name = 'dsh', {
+  reflowCursorLine = false, env = {}, reasoningEffort, cwd = root,
+  command = `${quote(process.execPath)} ${quote(path.join(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js'))} --profile tui`,
+} = {}) {
   const home = mkdtempSync(path.join(tmpdir(), 'dsh-tui-'));
   const profile = path.join(home, 'profiles', 'tui');
   mkdirSync(path.join(profile, 'node_modules', '@ekil9'), { recursive: true });
@@ -26,16 +29,18 @@ export async function startDsh(t, name = 'dsh', { reflowCursorLine = false, env 
     '- id: session-title-llm', '  disabled: true',
     '- insert:', '    - id: test-model', `      name: ${JSON.stringify(path.join(root, 'test/fixtures/model.mjs'))}`,
   ].join('\n'));
+  if (reasoningEffort !== undefined) writeFileSync(path.join(home, 'settings.yaml'), JSON.stringify({
+    'agent-default-model': { provider: 'test', model: 'test', reasoningEffort },
+  }));
   const app = await startApp(t, {
-    name, reflowCursorLine,
-    command: `${quote(process.execPath)} node_modules/@deepseek-ai/dsh/lib/bin.js --profile tui`,
+    name, reflowCursorLine, cwd, command,
     env: { ...env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', DSH_TOOLS_MODE: 'native' },
   });
   t.after(() => rmSync(home, { recursive: true, force: true }));
   return Object.assign(app, { home });
 }
 
-export async function startApp(t, { name = 'dialogue', command = `${quote(process.execPath)} test/fixtures/dialogue.mjs`, env = {}, reflowCursorLine = false } = {}) {
+export async function startApp(t, { name = 'dialogue', command = `${quote(process.execPath)} test/fixtures/dialogue.mjs`, env = {}, reflowCursorLine = false, cwd = root } = {}) {
   if (process.platform === 'darwin') {
     chmodSync(path.join(root, `node_modules/node-pty/prebuilds/darwin-${process.arch}/spawn-helper`), 0o755);
   }
@@ -52,7 +57,7 @@ export async function startApp(t, { name = 'dialogue', command = `${quote(proces
     echo APP_EXIT=$code
     read -r line
     printf 'SHELL_ECHO=%s\n' "$line"
-  `], { cwd: root, cols: 80, rows: 24, name: 'xterm-256color', env: { ...process.env, TERM: 'xterm-256color', NO_COLOR: '1', ...env } });
+  `], { cwd, cols: 80, rows: 24, name: 'xterm-256color', env: { ...process.env, TERM: 'xterm-256color', NO_COLOR: '1', ...env } });
   terminal.onData(data => shell.write(data));
   shell.onData(data => { raw += data; terminal.write(data); });
   shell.onExit(() => { exited = true; });
@@ -78,9 +83,18 @@ export async function startApp(t, { name = 'dialogue', command = `${quote(proces
       const buffer = terminal.buffer.normal;
       return buffer.getLine(buffer.baseY + buffer.cursorY).translateToString(true);
     },
+    status() {
+      const buffer = terminal.buffer.normal;
+      return buffer.getLine(buffer.baseY + buffer.cursorY - 1)?.translateToString(true) ?? '';
+    },
     footer() {
       const buffer = terminal.buffer.normal;
-      return buffer.getLine(buffer.baseY + buffer.cursorY + 1)?.translateToString(true) ?? '';
+      // Inline content may leave blank rows below it after a conservative resize.
+      for (let y = terminal.rows - 1; y > buffer.cursorY; y--) {
+        const line = buffer.getLine(buffer.baseY + y)?.translateToString(true);
+        if (line) return line;
+      }
+      return '';
     },
     get raw() { return raw; },
     async input(text) { shell.write(text); await delay(100); },

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import { startApp, startDsh } from './support/pty.mjs';
 
@@ -11,17 +14,132 @@ test('the built native addon loads in a fresh Node process', () => {
   assert.equal(result.stdout.trim(), 'function');
 });
 
-test('the editor has a separator and an actual-model footer without moving the draft cursor', async t => {
-  const app = await startDsh(t, 'footer');
+test('bun dev builds and starts the TUI, accepts a turn, and restores the shell', async t => {
+  const app = await startDsh(t, 'bun-dev', { command: 'bun dev' });
+  await app.waitFor(text => text.includes('dsh · test') || text.includes('APP_EXIT='), 30000);
+  assert.match(app.all(), /dsh · test/);
+  await app.input('from-bun-dev\r');
+  await app.waitFor('Reply: from-bun-dev');
+  await app.input('\x04');
+  await app.shellCheck();
+  assert.equal(app.all().split('Reply: from-bun-dev').length - 1, 1);
+});
+
+test('input starts at column zero without a prompt prefix and keeps a typed greater-than sign', async t => {
+  const app = await startDsh(t, 'input-no-prefix');
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  assert.equal(app.editor(), '');
+  assert.equal(app.terminal.buffer.normal.cursorX, 0);
+  await app.input('中文😀ab\x1b[D');
+  assert.equal(app.editor(), '中文😀ab');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.input('\x01> ');
+  assert.equal(app.editor(), '> 中文😀ab');
+  assert.equal(app.terminal.buffer.normal.cursorX, 2);
+  await app.input('\r');
+  await app.waitFor('Reply: > 中文😀ab');
+  await app.input('\x04');
+  await app.shellCheck();
+  assert.equal(app.all().split('> > 中文😀ab').length - 1, 1);
+});
+
+test('pi-style effort borders enclose the editor above the path and right-aligned model', async t => {
+  const app = await startDsh(t, 'footer', { reasoningEffort: 'high', env: { NO_COLOR: '' } });
   await app.waitFor('dsh · test', 15000);
   await app.input('中文😀ab\x1b[D');
   const buffer = app.terminal.buffer.normal;
   const cursor = buffer.baseY + buffer.cursorY;
-  assert.match(buffer.getLine(cursor - 1).translateToString(true), /─/);
-  assert.match(buffer.getLine(cursor + 1).translateToString(true), /test\/test.*idle/);
-  assert.equal(buffer.cursorX, 9);
+  assert.match(buffer.getLine(cursor - 1).translateToString(true), /^─ Idle .*─$/);
+  assert.equal(buffer.getLine(cursor + 1).translateToString(true), '─'.repeat(80));
+  assert.match(buffer.getLine(cursor + 2).translateToString(true), /workspace\/dsh-tui/);
+  assert.match(buffer.getLine(cursor + 3).translateToString(true), /\(test\) test · high$/);
+  assert.equal(buffer.getLine(cursor + 3).translateToString(true).length, 80);
+  assert.equal(buffer.getLine(cursor - 1).getCell(0).getFgColor(), 0xb294bb);
+  assert.equal(buffer.getLine(cursor + 1).getCell(0).getFgColor(), 0xb294bb);
+  assert.equal(app.editor(), '中文😀ab');
+  assert.equal(buffer.getLine(cursor).getCell(0).isFgDefault(), true);
+  assert.equal(buffer.cursorX, 7);
   await app.input('\x03\x04');
   await app.shellCheck();
+});
+
+test('the workspace line shows the home-relative Unicode path and Git branch across model changes', async t => {
+  const home = realpathSync(mkdtempSync(path.join(tmpdir(), 'dsh-tui-workspace-')));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const cwd = path.join(home, '工作😀');
+  mkdirSync(cwd);
+  assert.equal(spawnSync('git', ['init', '--initial-branch=style-test', cwd]).status, 0);
+  const app = await startDsh(t, 'workspace', { cwd, env: { HOME: home } });
+  await app.waitFor('dsh · test', 15000);
+  const directory = () => {
+    const buffer = app.terminal.buffer.normal;
+    return buffer.getLine(buffer.baseY + buffer.cursorY + 2).translateToString(true);
+  };
+  assert.match(directory(), /^~\/工作😀 \(style-test\) +extensions 0 · preset standard$/);
+  await app.input('/model test/flash\r');
+  await app.waitFor('Model: test/flash (session only)');
+  assert.match(directory(), /^~\/工作😀 \(style-test\) +extensions 0 · preset standard$/);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('narrow footers retain the effort and Unicode draft cursor rather than clipping the model suffix', async t => {
+  const app = await startDsh(t, 'footer-narrow', { reasoningEffort: 'max', env: { NO_COLOR: '' } });
+  await app.waitFor(() => app.footer().endsWith('(test) test · max'), 15000);
+  await app.input('中😀x');
+  for (const [cols, expected] of [[12, '… test · max'], [8, '…t · max'], [80, '(test) test · max']]) {
+    await app.resize(cols, 12);
+    assert.ok(app.footer().endsWith(expected), app.footer());
+    assert.equal(app.editor(), '中😀x');
+    assert.equal(app.terminal.buffer.normal.cursorX, 5);
+    const buffer = app.terminal.buffer.normal;
+    assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY + 1).getCell(0).getFgColor(), 0xff5fff);
+  }
+  await app.input('\x03\x04');
+  await app.shellCheck();
+});
+
+test('reported token totals occupy the left footer and reset with /new', async t => {
+  const app = await startDsh(t, 'footer-usage');
+  await app.waitFor('dsh · test', 15000);
+  assert.doesNotMatch(app.footer(), /↑|↓|\$|\/help/);
+  await app.input('usage\r');
+  await app.waitFor('Reply: usage');
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  assert.match(app.footer(), /^↑1k ↓42 R2k +\(test\) test · default$/);
+  await app.input('usage\r');
+  await app.waitFor(() => app.footer().startsWith('↑2k ↓84 R4k '));
+  await app.input('/new\r');
+  await app.waitFor('New session:');
+  assert.doesNotMatch(app.footer(), /↑|↓|\$/);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('each pi effort has its own border color and model switches clear stale effort', async t => {
+  // Expected RGB values come from pi's built-in dark theme, not the renderer.
+  for (const [effort, color] of [
+    ['off', 0x505050], ['minimal', 0x6e6e6e], ['low', 0x5f87af], ['medium', 0x81a2be],
+    ['high', 0xb294bb], ['xhigh', 0xd183e8], ['max', 0xff5fff],
+  ]) await t.test(effort, async t => {
+    const app = await startDsh(t, `effort-${effort}`, { reasoningEffort: effort, env: { NO_COLOR: '' } });
+    await app.waitFor(() => app.footer().endsWith(`(test) test · ${effort}`), 15000);
+    const borderColor = () => {
+      const buffer = app.terminal.buffer.normal;
+      return buffer.getLine(buffer.baseY + buffer.cursorY - 1).getCell(0).getFgColor();
+    };
+    assert.equal(borderColor(), color);
+    await app.input('/model test/flash\r');
+    await app.waitFor(() => app.footer().endsWith('(test) flash · default'));
+    assert.equal(borderColor(), 0x8ba4e8);
+    await app.input('/fi');
+    const buffer = app.terminal.buffer.normal;
+    const candidate = buffer.getLine(buffer.baseY + buffer.cursorY + 2);
+    assert.match(candidate.translateToString(true), /^> \/fixture/);
+    assert.equal(candidate.getCell(0).getFgColor(), 0x8ba4e8);
+    await app.input('\x03\x04');
+    await app.shellCheck();
+  });
 });
 
 test('native inline conversation streams, commits once, and restores the same shell', async t => {
@@ -42,7 +160,7 @@ test('the real dsh bundle creates one session and accepts consecutive turns', as
   await app.waitFor('Reply: first');
   await app.input('second\r');
   await app.waitFor('Reply: second');
-  await app.waitFor(() => app.editor() === '>');
+  await app.waitFor(() => app.editor() === '');
   await app.input('\x04');
   await app.shellCheck();
   assert.equal(app.all().split('Reply: first').length - 1, 1);
@@ -83,7 +201,7 @@ test('Ctrl+C cancels work, clears an idle draft, then exits with 130', async t =
   await app.waitFor('Stopped.');
   await app.input('draft');
   await app.input('\x03');
-  await app.waitFor(() => app.editor() === '>');
+  await app.waitFor(() => app.editor() === '');
   await app.input('\x03');
   await app.shellCheck(130);
 });
@@ -97,7 +215,8 @@ test('/new resets model context without deleting or replaying terminal history',
   await app.waitFor('Model: test/flash (session only)');
   await app.input('/new\r');
   await app.waitFor('New session:');
-  assert.match(app.footer(), /^test\/test · idle/);
+  assert.match(app.footer(), /\(test\) test · default$/);
+  assert.match(app.status(), /^─ Idle /);
   await app.input('history-count\r');
   await app.waitFor('User messages: 1');
   await app.input('/help\r');
@@ -109,11 +228,73 @@ test('/new resets model context without deleting or replaying terminal history',
   await app.shellCheck();
 });
 
+test('thinking and response phases keep reasoning out of the preview and committed history', async t => {
+  const app = await startDsh(t, 'reasoning');
+  await app.waitFor('dsh · test', 15000);
+  await app.input('reasoning\r');
+  await app.waitFor(() => app.status().startsWith('─ Thinking '));
+  assert.match(app.footer(), /^Esc to stop/);
+  assert.doesNotMatch(app.raw, /PRIVATE_REASONING|Never display this block/);
+  await app.input('draft中😀\x1b[D');
+  await app.waitFor(() => app.status().startsWith('─ Responding '));
+  assert.match(app.all(), /Visible answer/);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  assert.match(app.all(), /Visible answer complete\./);
+  assert.doesNotMatch(app.raw, /PRIVATE_REASONING|Never display this block/);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.input('\x03\x04');
+  await app.shellCheck();
+  assert.equal(app.all().split('Visible answer complete.').length - 1, 1);
+});
+
+test('Escape during thinking leaves no reasoning or empty incomplete answer and keeps the draft', async t => {
+  const app = await startDsh(t, 'reasoning-cancel');
+  await app.waitFor('dsh · test', 15000);
+  await app.input('reasoning\r');
+  await app.waitFor(() => app.status().startsWith('─ Thinking '));
+  await app.input('draft中😀\x1b[D');
+  await app.input('\x1b');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('Stopped.'));
+  assert.doesNotMatch(app.raw, /PRIVATE_REASONING|Never display this block|\[incomplete\]/);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.input('\x03recovered\r');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('Reply: recovered'));
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('a long streamed answer commits once without preview fragments or status rows in history', async t => {
+  const app = await startDsh(t, 'long-reply');
+  await app.waitFor('dsh · test', 15000);
+  await app.input('long-reply\r');
+  await app.input('draft中😀\x1b[D');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('LONG_END'));
+  const buffer = app.terminal.buffer.normal;
+  const cursor = buffer.baseY + buffer.cursorY;
+  const history = Array.from({ length: cursor - 1 }, (_, y) => buffer.getLine(y).translateToString(true)).join('\n');
+  assert.doesNotMatch(history, /─ (?:Idle|Working|Thinking|Responding) |extensions \d+ · preset|Esc to stop/);
+  const markers = ['LONG_TITLE', ...Array.from({ length: 48 }, (_, i) => `LONG_${String(i).padStart(3, '0')}`), 'LONG_END'];
+  let previous = -1;
+  for (const marker of markers) {
+    assert.equal(history.split(marker).length - 1, 1, `${marker} must appear exactly once`);
+    assert.ok(history.indexOf(marker) > previous, `${marker} must stay in order`);
+    previous = history.indexOf(marker);
+  }
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(buffer.cursorX, 7);
+  await app.input('\x03\x04');
+  await app.shellCheck();
+});
+
 test('color mode distinguishes submitted messages, headings, emphasis, and code', async t => {
   const app = await startDsh(t, 'markdown-color', { env: { NO_COLOR: '' } });
   await app.waitFor('dsh · test', 15000);
   await app.input('markdown\r');
-  await app.waitFor(() => app.footer().includes(' · idle') && app.all().includes('const answer = 42;'));
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('const answer = 42;'));
   const lines = Array.from({ length: app.terminal.buffer.normal.length }, (_, i) => app.terminal.buffer.normal.getLine(i));
   const cell = (line, column) => lines.find(row => row.translateToString(true) === line)?.getCell(column);
   assert.ok(cell('> markdown', 0)?.isBold());
@@ -123,7 +304,10 @@ test('color mode distinguishes submitted messages, headings, emphasis, and code'
   assert.ok(cell('A bold word and inline.', 2)?.isBold());
   assert.equal(cell('  const answer = 42;', 2)?.isFgDefault(), false);
   const buffer = app.terminal.buffer.normal;
-  assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY + 1).getCell(0).isFgDefault(), true);
+  const footer = buffer.getLine(buffer.baseY + buffer.cursorY + 3);
+  const modelColumn = footer.translateToString(true).indexOf('(test)');
+  assert.notEqual(modelColumn, -1);
+  assert.equal(footer.getCell(modelColumn).getFgColor(), 0x808080);
   await app.input('\x04');
   await app.shellCheck();
 });
@@ -132,7 +316,7 @@ test('Markdown preserves quote and numbered-list semantics and respects NO_COLOR
   const app = await startDsh(t, 'markdown-semantics');
   await app.waitFor('dsh · test', 15000);
   await app.input('markdown\r');
-  await app.waitFor(() => app.footer().includes(' · idle') && app.all().includes('const answer = 42;'));
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('const answer = 42;'));
   assert.match(app.all(), /│ quoted text/);
   assert.match(app.all(), /7\. seventh\n8\. eighth/);
   const buffer = app.terminal.buffer.normal;
@@ -154,7 +338,7 @@ test('answers render Markdown while submitted text stays literal and code surviv
   await app.waitFor('Reply: literal');
   await app.input('markdown\r');
   await app.waitFor('const answer = 42;');
-  await app.waitFor(text => text.includes('test/test · idle'));
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
   assert.match(app.all(), /> literal \*\*stars\*\*/);
   assert.doesNotMatch(app.all(), /## Summary|\*\*bold\*\*|```js/);
   assert.match(app.all(), /A bold word and inline/);
@@ -183,6 +367,144 @@ test('saving from the model picker explicitly changes the startup default for a 
   await fresh.shellCheck();
 });
 
+test('preset selection changes the real tool catalog only before the first turn and never saves a default', async t => {
+  const app = await startDsh(t, 'preset-select');
+  await app.waitFor('dsh · test', 15000);
+  const settingsPath = path.join(app.home, 'settings.yaml');
+  const settings = () => existsSync(settingsPath) ? readFileSync(settingsPath, 'utf8') : null;
+  const before = settings();
+  await app.input('/preset minimal\r');
+  await app.waitFor(text => text.includes('Preset: minimal') || text.includes('Unknown or invalid command'));
+  assert.match(app.all(), /Preset: minimal/);
+  await app.input('tool-catalog\r');
+  await app.waitFor('Tools: bash, fixture_tool');
+  await app.input('/preset standard\r');
+  await app.waitFor('Preset is locked after the first turn. Use /new before changing it.');
+  await app.input('/new\r');
+  await app.waitFor('New session:');
+  await app.input('tool-catalog\r');
+  await app.waitFor('ask_user_question');
+  assert.equal(settings(), before);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('extensions show real host and dynamic state and newly registered commands are usable', async t => {
+  const app = await startDsh(t, 'extensions');
+  await app.waitFor('dsh · test', 15000);
+  const context = () => {
+    const buffer = app.terminal.buffer.normal;
+    return buffer.getLine(buffer.baseY + buffer.cursorY + 2).translateToString(true);
+  };
+  assert.match(context(), /extensions 0 · preset standard$/);
+  await app.input('/extensions\r');
+  await app.waitFor(() => app.status().startsWith('─ Extensions '));
+  await app.input('host · @deepseek-ai/dsh-tool-bash\r');
+  await app.waitFor('State: disabled');
+  assert.match(app.all(), /Scope: host/);
+  await app.input('/fixture extension\r');
+  await app.waitFor('Fixture extension running');
+  await app.waitFor(() => /extensions 1 · preset standard$/.test(context()));
+  await app.input('/extension-fixture\r');
+  await app.waitFor('Extension command ready');
+  await app.input('/extensions Fixture extension\r');
+  await app.waitFor(() => app.status().startsWith('─ Extensions '));
+  await app.input('\r');
+  await app.waitFor('Extension: Fixture extension');
+  assert.match(app.all(), /State: running/);
+  assert.match(app.all(), /Scope: current session/);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('browser-only extensions are explicitly rejected instead of waiting for a nonexistent Web client', async t => {
+  const app = await startDsh(t, 'extension-client');
+  await app.waitFor('dsh · test', 15000);
+  await app.input('/fixture client-extension\r');
+  await app.waitFor('Browser extensions are not supported in this TUI. Use a host-only extension.');
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  await app.input('/extensions Client fixture\r');
+  await app.waitFor(() => app.status().startsWith('─ Extensions '));
+  await app.input('\r');
+  await app.waitFor('State: rejected');
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('PTC and Cordis presets expose their real model tools without a Web server', async t => {
+  for (const [preset, tool] of [['ptc', 'run_code'], ['cordis', 'cordis_define']]) await t.test(preset, async t => {
+    const app = await startDsh(t, `preset-${preset}`);
+    await app.waitFor('dsh · test', 15000);
+    await app.input(`/preset ${preset}\r`);
+    await app.waitFor(text => text.includes(`Preset: ${preset} (session only)`) || text.includes('Command failed:'));
+    assert.ok(app.all().includes(`Preset: ${preset} (session only)`), app.all().slice(-2500));
+    await app.input('tool-catalog\r');
+    await app.waitFor(text => text.replaceAll('\n', '').includes(tool));
+    await app.input('\x04');
+    await app.shellCheck();
+  });
+});
+
+test('the preset picker discovers local presets, stays outside the input, and never treats Ctrl+S as save', async t => {
+  const app = await startDsh(t, 'preset-picker');
+  await app.waitFor('dsh · test', 15000);
+  cpSync(new URL('../node_modules/@deepseek-ai/dsh-agent-presets/presets/minimal', import.meta.url),
+    path.join(app.home, '.agent-presets/local-minimal'), { recursive: true });
+  await app.input('/preset\r');
+  await app.waitFor(text => text.includes('Select preset') || text.includes('Usage: /preset'));
+  assert.match(app.status(), /^─ Select preset /);
+  for (const id of ['standard', 'ptc', 'cordis', 'minimal', 'local-minimal']) assert.ok(app.all().includes(id));
+  await app.input('local-minimal\x13');
+  assert.match(app.status(), /^─ Select preset /);
+  assert.doesNotMatch(app.footer(), /Ctrl\+S/);
+  assert.equal(app.editor(), 'local-minimal');
+  const buffer = app.terminal.buffer.normal;
+  const cursor = buffer.baseY + buffer.cursorY;
+  assert.equal(buffer.getLine(cursor + 1).translateToString(true), '─'.repeat(80));
+  assert.match(buffer.getLine(cursor + 2).translateToString(true), /^> local-minimal/);
+  await app.input('\x1b');
+  await app.waitFor('Preset selection cancelled.');
+  await app.input('/preset\r');
+  await app.waitFor(() => app.status().startsWith('─ Select preset '));
+  await app.input('local-minimal\r');
+  await app.waitFor('Preset: local-minimal (session only)');
+  await app.input('tool-catalog\r');
+  await app.waitFor('Tools: bash, fixture_tool');
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('the model list shows eight real choices outside the input and scrolls across resizes', async t => {
+  const app = await startDsh(t, 'model-list');
+  await app.waitFor('dsh · test', 15000);
+  await app.input('/model\r');
+  await app.waitFor('Select model');
+  await app.input('option');
+  for (const [cols, rows, count] of [[80, 24, 8], [40, 12, 6], [40, 8, 2], [80, 24, 8]]) {
+    await app.resize(cols, rows);
+    const buffer = app.terminal.buffer.normal;
+    const cursor = buffer.baseY + buffer.cursorY;
+    assert.equal(app.editor(), 'option');
+    assert.match(app.status(), /^─ Select model · 1\/12 /);
+    assert.equal(buffer.cursorX, 6);
+    assert.equal(buffer.getLine(cursor + 1).translateToString(true), '─'.repeat(cols));
+    for (let i = 0; i < count; i++) {
+      assert.ok(buffer.getLine(cursor + 2 + i).translateToString(true).includes(`test/option-${String(i + 1).padStart(2, '0')}`));
+    }
+    assert.doesNotMatch(app.all(), new RegExp(`test/option-${String(count + 1).padStart(2, '0')}`));
+  }
+  await app.input('\x1b[B'.repeat(9));
+  await app.waitFor('> test/option-10');
+  assert.match(app.status(), /^─ Select model · 10\/12 /);
+  assert.equal(app.editor(), 'option');
+  await app.input('\r');
+  await app.waitFor('Model: test/option-10 (session only)');
+  await app.input('which-model\r');
+  await app.waitFor('Model used: option-10');
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
 test('an empty model search never reads prompt history and Escape cancels the picker', async t => {
   const app = await startDsh(t, 'model-empty');
   await app.waitFor('dsh · test', 15000);
@@ -191,12 +513,13 @@ test('an empty model search never reads prompt history and Escape cancels the pi
   await app.input('no-such-model');
   await app.waitFor('No matching models');
   await app.input('\x1b[A');
-  assert.equal(app.editor(), '> no-such-model');
+  assert.equal(app.editor(), 'no-such-model');
   await app.input('\x1b[B\r');
-  assert.equal(app.editor(), '> no-such-model');
+  assert.equal(app.editor(), 'no-such-model');
   await app.input('\x1b');
   await app.waitFor('Model selection cancelled.');
-  assert.match(app.footer(), /^test\/test · idle/);
+  assert.match(app.footer(), /\(test\) test · default$/);
+  assert.match(app.status(), /^─ Idle /);
   await app.input('ready\r');
   await app.waitFor('Reply: ready');
   await app.input('\x04');
@@ -212,9 +535,11 @@ test('the model picker searches the provider catalog and selects without changin
   await app.waitFor('test/flash — Flash test model');
   const buffer = app.terminal.buffer.normal;
   const cursor = buffer.baseY + buffer.cursorY;
-  assert.equal(app.editor(), '> test/flash');
-  assert.match(buffer.getLine(cursor + 1).translateToString(true), /^> test\/flash — Flash test model/);
-  assert.match(buffer.getLine(cursor + 3).translateToString(true), /^Select model/);
+  assert.equal(app.editor(), 'test/flash');
+  assert.equal(buffer.getLine(cursor + 1).translateToString(true), '─'.repeat(80));
+  assert.match(buffer.getLine(cursor + 2).translateToString(true), /^> test\/flash — Flash test model/);
+  assert.match(buffer.getLine(cursor - 1).translateToString(true), /^─ Select model /);
+  assert.match(buffer.getLine(cursor + 4).translateToString(true), /^Enter choose .*\(test\) test · default$/);
   await app.input('\r');
   await app.waitFor('Model: test/flash (session only)');
   await app.input('which-model\r');
@@ -223,7 +548,7 @@ test('the model picker searches the provider catalog and selects without changin
   await app.waitFor('Select model');
   await app.input('\x1b');
   await app.waitFor('Model selection cancelled.');
-  assert.equal(app.editor(), '>');
+  assert.equal(app.editor(), '');
   await app.input('\x04');
   await app.shellCheck();
 });
@@ -242,7 +567,7 @@ test('/model changes the actual request while leaving the saved default unchange
   await app.shellCheck();
 });
 
-test('slash candidates stay below the editor and above the footer across resizes', async t => {
+test('slash candidates stay outside the input border and above the footer across resizes', async t => {
   const app = await startDsh(t, 'completion-below');
   await app.waitFor('dsh · test', 15000);
   await app.input('placement-history\r');
@@ -252,20 +577,22 @@ test('slash candidates stay below the editor and above the footer across resizes
   const check = () => {
     const buffer = app.terminal.buffer.normal;
     const cursor = buffer.baseY + buffer.cursorY;
-    assert.equal(app.editor(), '> /fi');
-    assert.equal(buffer.cursorX, 5);
-    assert.match(buffer.getLine(cursor + 1)?.translateToString(true) ?? '', /^> \/fixture — Test command/);
-    assert.match(buffer.getLine(cursor + 3)?.translateToString(true) ?? '', /^test\/test · Tab complete/);
+    assert.equal(app.editor(), '/fi');
+    assert.equal(buffer.cursorX, 3);
+    assert.equal(buffer.getLine(cursor + 1)?.translateToString(true), '─'.repeat(app.terminal.cols));
+    assert.match(buffer.getLine(cursor + 2)?.translateToString(true) ?? '', /^> \/fixture — Test command/);
+    assert.match(buffer.getLine(cursor - 1)?.translateToString(true) ?? '', /^─ Commands /);
+    assert.match(buffer.getLine(cursor + 4)?.translateToString(true) ?? '', /\(test\) test · default$/);
     assert.equal(app.all().split('> placement-history').length - 1, 1);
     assert.equal(app.all().split('Reply: placement-history').length - 1, 1);
   };
   check();
-  for (const [cols, rows] of [[80, 12], [30, 12], [80, 24]]) {
+  for (const [cols, rows] of [[80, 12], [30, 12], [80, 8], [80, 24]]) {
     await app.resize(cols, rows);
     check();
   }
   await app.input('\x1b');
-  assert.equal(app.editor(), '> /fi');
+  assert.equal(app.editor(), '/fi');
   assert.doesNotMatch(app.all(), /Test command/);
   await app.input('\x03\x04');
   await app.shellCheck();
@@ -277,10 +604,10 @@ test('slash completion filters real commands, preserves the draft on Escape, and
   await app.input('/fi');
   await app.waitFor('/fixture — Test command');
   await app.input('\x1b');
-  assert.equal(app.editor(), '> /fi');
+  assert.equal(app.editor(), '/fi');
   assert.doesNotMatch(app.all(), /Test command/);
   await app.input('x\x7f\t');
-  assert.equal(app.editor().trimEnd(), '> /fixture');
+  assert.equal(app.editor().trimEnd(), '/fixture');
   assert.doesNotMatch(app.all(), /Command ready/);
   await app.input('\r');
   await app.waitFor('Command ready');
@@ -317,7 +644,7 @@ test('a waiting command can be cancelled without exiting or losing the next draf
   const app = await startDsh(t, 'command-cancel');
   await app.waitFor('dsh · test', 15000);
   await app.input('/fixture wait\r');
-  await app.waitFor('command');
+  await app.waitFor(() => app.status().startsWith('─ Command '));
   await app.input('next\r');
   await app.input('\x03');
   await app.waitFor('Command cancelled.');
@@ -335,7 +662,7 @@ test('approval reaches the real service and restores the interrupted Unicode dra
   await app.waitFor('Allow fixture_tool once?');
   await app.input('y\r');
   await app.waitFor('Decision: allowed-once');
-  await app.waitFor('> saved中😀');
+  await app.waitFor(() => app.editor().trimEnd() === 'saved中😀');
   await app.input('\r');
   await app.waitFor('Reply: saved中😀');
   await app.input('\x04');
@@ -360,10 +687,10 @@ test('Unicode editing and multiline paste produce one single-line submission', a
   const app = await startDsh(t, 'input');
   await app.waitFor('dsh · test', 15000);
   await app.input('中文😀ab\x1b[D');
-  assert.equal(app.terminal.buffer.normal.cursorX, 9);
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
   await app.input('\x1b[200~X\r\nY\x1b[201~');
-  await app.waitFor('> 中文😀aX Yb');
-  assert.equal(app.terminal.buffer.normal.cursorX, 12);
+  await app.waitFor(() => app.editor().trimEnd() === '中文😀aX Yb');
+  assert.equal(app.terminal.buffer.normal.cursorX, 10);
   assert.doesNotMatch(app.all(), /Reply:/);
   await app.input('\r');
   await app.waitFor('Reply: 中文😀aX Yb');
@@ -377,10 +704,10 @@ test('input history restores the saved draft and its cursor without replaying an
   await app.input('first\r');
   await app.waitFor('Reply: first');
   await app.input('draft\x1b[D\x1b[A');
-  await app.waitFor(() => app.editor() === '> first');
+  await app.waitFor(() => app.editor() === 'first');
   await app.input('\x1b[B');
-  await app.waitFor('> draft');
-  assert.equal(app.terminal.buffer.normal.cursorX, 6);
+  await app.waitFor(() => app.editor().trimEnd() === 'draft');
+  assert.equal(app.terminal.buffer.normal.cursorX, 4);
   await app.input('\x03');
   await app.input('\x04');
   await app.shellCheck();
@@ -391,12 +718,12 @@ test('standard line shortcuts edit Unicode without splitting characters', async 
   const app = await startDsh(t, 'shortcuts');
   await app.waitFor('dsh · test', 15000);
   await app.input('alpha 中文😀 omega\x01');
-  assert.equal(app.terminal.buffer.normal.cursorX, 2);
+  assert.equal(app.terminal.buffer.normal.cursorX, 0);
   await app.input('\x05\x17');
-  await app.waitFor('> alpha 中文😀');
+  await app.waitFor(() => app.editor().trimEnd() === 'alpha 中文😀');
   assert.doesNotMatch(app.all(), /omega/);
   await app.input('\x15left right\x01\x1b[C\x1b[C\x1b[C\x1b[C\x0b');
-  await app.waitFor('> left');
+  await app.waitFor(() => app.editor().trimEnd() === 'left');
   assert.doesNotMatch(app.all(), /left right/);
   await app.input('\x15done\r');
   await app.waitFor('Reply: done');
@@ -411,8 +738,8 @@ test('external process-stream output cannot clear history or disrupt a partially
   await app.input('draft\x1b[D');
   await app.waitFor('External warning');
   await app.waitFor('Reply: log');
-  await app.waitFor(() => app.footer().includes(' · idle') && app.editor() === '> draft');
-  assert.equal(app.terminal.buffer.normal.cursorX, 6);
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.editor() === 'draft');
+  assert.equal(app.terminal.buffer.normal.cursorX, 4);
   await app.input('\x03\x04');
   await app.shellCheck();
 });
@@ -444,7 +771,7 @@ for (const reflow of [false, true]) test(`submitted prompts and answers survive 
   assert.equal(app.all().split('> history-window').length - 1, 1);
   await app.input('draft😀');
   for (const [cols, rows] of [[80, 12], [30, 12], [8, 12], [80, 24]]) await app.resize(cols, rows);
-  await app.waitFor('> draft😀');
+  await app.waitFor(() => app.editor().trimEnd() === 'draft😀');
   assert.equal(app.all().split('> history-window').length - 1, 1);
   assert.equal(app.all().split('Reply: history-window').length - 1, 1);
   await app.input('\x03\x04');

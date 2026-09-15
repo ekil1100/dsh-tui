@@ -10,12 +10,35 @@ use eye_declare::{
 use napi::{Error, Result};
 use napi_derive::napi;
 use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::text::Line;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use unicode_segmentation::UnicodeSegmentation;
 
 type Outcome = std::result::Result<(), String>;
+
+// A muted blue accent for dark terminals; keep effort colors independent.
+const ACCENT: Color = Color::Rgb(0x8b, 0xa4, 0xe8);
+const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
+
+/// Keep the end of a status label readable without splitting a display grapheme.
+fn fit_suffix(label: &str, columns: u16) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+    let mut width = Line::from(label).width();
+    if width <= columns as usize {
+        return label.to_string();
+    }
+    for (index, grapheme) in label.grapheme_indices(true) {
+        width -= Line::from(grapheme).width();
+        if width < columns as usize {
+            return format!("…{}", &label[index + grapheme.len()..]);
+        }
+    }
+    "…".into()
+}
 
 #[derive(Clone, Deserialize)]
 struct Prompt {
@@ -30,7 +53,7 @@ struct Command {
 }
 
 #[derive(Clone, Deserialize)]
-struct ModelItem {
+struct PickerItem {
     value: String,
     label: String,
 }
@@ -38,7 +61,12 @@ struct ModelItem {
 #[derive(Clone, Deserialize)]
 struct Picker {
     id: String,
-    items: Vec<ModelItem>,
+    items: Vec<PickerItem>,
+    title: String,
+    hint: String,
+    empty: String,
+    #[serde(rename = "allowSave")]
+    allow_save: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -61,10 +89,15 @@ struct Entry {
 struct Frame {
     committed: Vec<Entry>,
     active: String,
+    activity: String,
     mode: String,
     interaction: Option<Prompt>,
     model: String,
+    effort: String,
     cwd: String,
+    preset: String,
+    extensions: usize,
+    stats: String,
     commands: Vec<Command>,
     picker: Option<Picker>,
 }
@@ -75,7 +108,7 @@ enum Msg {
     Edit(InputEvent),
     Submit,
     Complete,
-    SaveModel,
+    SaveChoice,
     Eof,
     Escape,
     Interrupt,
@@ -115,7 +148,7 @@ impl TerminalApp {
         }
     }
 
-    fn models(&self) -> Vec<&ModelItem> {
+    fn choices(&self) -> Vec<&PickerItem> {
         if self.frame.interaction.is_some() {
             return Vec::new();
         }
@@ -133,10 +166,13 @@ impl TerminalApp {
             .unwrap_or_default()
     }
 
-    fn choose_model(&self, save: bool) {
+    fn choose(&self, save: bool) {
         if let Some(picker) = &self.frame.picker {
-            let models = self.models();
-            if let Some(item) = models.get(self.candidate.min(models.len().saturating_sub(1))) {
+            if save && !picker.allow_save {
+                return;
+            }
+            let choices = self.choices();
+            if let Some(item) = choices.get(self.candidate.min(choices.len().saturating_sub(1))) {
                 let _ = self.events.send(
                     json!({"type": "pick", "id": picker.id, "value": item.value, "save": save})
                         .to_string(),
@@ -195,7 +231,7 @@ impl App for TerminalApp {
                 receiver.recv().await.map(|message| (message, receiver))
             })),
         );
-        ctx.push(text(&self.header));
+        ctx.push(text(&self.header).style(self.style(ACCENT)));
         let _ = self.events.send(json!({"type": "ready"}).to_string());
     }
 
@@ -234,7 +270,7 @@ impl App for TerminalApp {
                     match committed.kind {
                         EntryKind::User => {
                             let style = if self.color {
-                                self.style(Color::Cyan).add_modifier(Modifier::BOLD)
+                                self.style(ACCENT).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
                             };
@@ -242,7 +278,11 @@ impl App for TerminalApp {
                         }
                         EntryKind::Assistant => {
                             let styles = if self.color {
-                                MarkdownStyles::default()
+                                MarkdownStyles {
+                                    heading: self.style(ACCENT).add_modifier(Modifier::BOLD),
+                                    code_inline: self.style(ACCENT),
+                                    ..MarkdownStyles::default()
+                                }
                             } else {
                                 MarkdownStyles {
                                     base: Style::default(),
@@ -280,14 +320,14 @@ impl App for TerminalApp {
                 self.input.handle(&event);
             }
             Msg::Complete => self.complete(true),
-            Msg::SaveModel => {
+            Msg::SaveChoice => {
                 if self.frame.interaction.is_none() {
-                    self.choose_model(true);
+                    self.choose(true);
                 }
             }
             Msg::Submit => {
                 if self.frame.picker.is_some() && self.frame.interaction.is_none() {
-                    self.choose_model(false);
+                    self.choose(false);
                     return;
                 }
                 if self.frame.mode == "command" {
@@ -342,7 +382,7 @@ impl App for TerminalApp {
             }
             Msg::History(previous) => {
                 let count = if self.frame.picker.is_some() {
-                    self.models().len()
+                    self.choices().len()
                 } else {
                     self.completions().len()
                 };
@@ -420,35 +460,109 @@ impl App for TerminalApp {
     }
 
     fn tail(&self) -> impl Element + '_ {
-        let height = self.rows.saturating_sub(1).clamp(1, 4);
         let mut tail = col();
         let candidates = self.completions();
-        let models = self.models();
+        let choices = self.choices();
         let picking = self.frame.picker.is_some() && self.frame.interaction.is_none();
-        if !picking && candidates.is_empty() {
-            if height > 3 {
-                tail = tail.child(viewport(self.frame.active.lines()).height(height - 3));
+        let item_count = if picking {
+            choices.len().max(1)
+        } else {
+            candidates.len()
+        };
+        let desired_menu_rows = item_count.min(8) as u16;
+        let height = self.rows.saturating_sub(1).clamp(1, 8 + desired_menu_rows);
+        // Preserve the input and its lower border before decorations in short terminals.
+        let footer_rows = u16::from(height >= 4 || (desired_menu_rows == 0 && height > 1));
+        let menu_rows = desired_menu_rows.min(if height >= 6 {
+            height - 5
+        } else {
+            height.saturating_sub(1 + footer_rows + u16::from(height > 1))
+        });
+        let chrome = height - 1 - footer_rows - menu_rows;
+        // Match pi's dark-theme thinking borders, independent of the brand accent.
+        let border = self.style(match self.frame.effort.as_str() {
+            "off" | "none" => Color::Rgb(0x50, 0x50, 0x50),
+            "minimal" => Color::Rgb(0x6e, 0x6e, 0x6e),
+            "low" => Color::Rgb(0x5f, 0x87, 0xaf),
+            "medium" => Color::Rgb(0x81, 0xa2, 0xbe),
+            "high" => Color::Rgb(0xb2, 0x94, 0xbb),
+            "xhigh" => Color::Rgb(0xd1, 0x83, 0xe8),
+            "max" => Color::Rgb(0xff, 0x5f, 0xff),
+            _ => ACCENT,
+        });
+        let (label, status) = if picking {
+            let picker = self
+                .frame
+                .picker
+                .as_ref()
+                .expect("Picking requires a dialog");
+            (picker.title.as_str(), picker.hint.as_str())
+        } else if !candidates.is_empty() {
+            ("Commands", "Tab complete · Enter run · Esc close")
+        } else {
+            match self.frame.mode.as_str() {
+                "running" => (
+                    match self.frame.activity.as_str() {
+                        "thinking" => "Thinking",
+                        "responding" => "Responding",
+                        _ => "Working",
+                    },
+                    "Esc to stop",
+                ),
+                "command" => ("Command", "Esc to cancel"),
+                "interaction" => ("Input", ""),
+                _ => ("Idle", ""),
             }
-            if height > 2 {
-                tail = tail
-                    .child(text("─".repeat(self.cols as usize)).style(self.style(Color::DarkGray)));
-            }
+        };
+        let hint = self
+            .frame
+            .interaction
+            .as_ref()
+            .map_or(status, |prompt| prompt.hint.as_str());
+        if chrome > 3 {
+            tail = tail.child(viewport(self.frame.active.lines()).height(chrome - 3));
+        }
+        if chrome > 1 {
+            let total = if picking {
+                choices.len()
+            } else {
+                candidates.len()
+            };
+            let heading = if picking || total > 0 {
+                let selected = if total == 0 {
+                    0
+                } else {
+                    self.candidate.min(total - 1) + 1
+                };
+                format!("─ {label} · {selected}/{total} ")
+            } else {
+                format!("─ {label} ")
+            };
+            let fill = (self.cols as usize).saturating_sub(Line::from(heading.as_str()).width());
+            tail = tail.child(
+                viewport([format!("{heading}{}", "─".repeat(fill))])
+                    .wrap(false)
+                    .style(border),
+            );
         }
         tail = tail.child(
-            row()
-                .fixed(2, text("> ").style(self.style(Color::Cyan)))
-                .fill(
-                    text_area(&self.input)
-                        .track_focus(&self.focus)
-                        .max_height(1),
-                ),
+            text_area(&self.input)
+                .track_focus(&self.focus)
+                .max_height(1),
         );
-        if picking && height > 2 {
-            let count = (height - 2) as usize;
-            let selected = self.candidate.min(models.len().saturating_sub(1));
+        if chrome > 0 {
+            tail = tail.child(
+                viewport(["─".repeat(self.cols as usize)])
+                    .wrap(false)
+                    .style(border),
+            );
+        }
+        if picking && menu_rows > 0 {
+            let count = menu_rows as usize;
+            let selected = self.candidate.min(choices.len().saturating_sub(1));
             let start = selected.saturating_sub(count - 1);
             for index in start..start + count {
-                let line = models
+                let line = choices
                     .get(index)
                     .map(|model| {
                         format!(
@@ -459,21 +573,26 @@ impl App for TerminalApp {
                     })
                     .unwrap_or_else(|| {
                         if index == start {
-                            "No matching models".into()
+                            self.frame
+                                .picker
+                                .as_ref()
+                                .expect("Picking requires a dialog")
+                                .empty
+                                .clone()
                         } else {
                             String::new()
                         }
                     });
                 tail = tail.child(viewport([line]).wrap(false).style(self.style(
                     if index == selected {
-                        Color::Cyan
+                        ACCENT
                     } else {
                         Color::Reset
                     },
                 )));
             }
-        } else if !candidates.is_empty() && height > 2 {
-            let count = (height - 2) as usize;
+        } else if !candidates.is_empty() && menu_rows > 0 {
+            let count = menu_rows as usize;
             let selected = self.candidate.min(candidates.len() - 1);
             let start = selected.saturating_sub(count - 1);
             for index in start..start + count {
@@ -490,38 +609,68 @@ impl App for TerminalApp {
                     .unwrap_or_default();
                 tail = tail.child(viewport([line]).wrap(false).style(self.style(
                     if index == selected {
-                        Color::Cyan
+                        ACCENT
                     } else {
                         Color::Reset
                     },
                 )));
             }
         }
-        if height > 1 {
-            let status = match self.frame.mode.as_str() {
-                "running" => "running · Esc to stop",
-                "command" => "command · Esc to cancel",
-                _ => "idle · /help",
-            };
-            let status = if picking {
-                "Select model · Enter choose · Ctrl+S save globally · Esc cancel"
-            } else if candidates.is_empty() {
-                status
+        if chrome > 2 {
+            let context = if self.frame.preset.is_empty() {
+                String::new()
             } else {
-                "Tab complete · Enter run · Esc close"
+                fit_suffix(
+                    &format!(
+                        "extensions {} · preset {}",
+                        self.frame.extensions, self.frame.preset
+                    ),
+                    self.cols,
+                )
             };
-            let hint = self
-                .frame
-                .interaction
-                .as_ref()
-                .map(|prompt| prompt.hint.as_str())
-                .unwrap_or(status);
-            let footer = if picking {
+            let width = Line::from(context.as_str()).width().min(self.cols as usize) as u16;
+            tail = tail.child(
+                row()
+                    .fill(
+                        viewport([&self.frame.cwd])
+                            .wrap(false)
+                            .style(self.style(MUTED)),
+                    )
+                    .fixed(u16::from(width > 0 && width < self.cols), text(" "))
+                    .fixed(
+                        width,
+                        viewport([context]).wrap(false).style(self.style(MUTED)),
+                    ),
+            );
+        }
+        if footer_rows > 0 {
+            let left = if !self.frame.stats.is_empty()
+                && !picking
+                && candidates.is_empty()
+                && self.frame.interaction.is_none()
+            {
+                if hint.is_empty() {
+                    self.frame.stats.clone()
+                } else {
+                    format!("{} · {hint}", self.frame.stats)
+                }
+            } else {
                 hint.to_string()
-            } else {
-                format!("{} · {} · {}", self.frame.model, hint, self.frame.cwd)
             };
-            tail = tail.child(viewport([footer]).wrap(false));
+            let model = fit_suffix(
+                &format!("{} · {}", self.frame.model, self.frame.effort),
+                self.cols,
+            );
+            let width = Line::from(model.as_str()).width().min(self.cols as usize) as u16;
+            tail = tail.child(
+                row()
+                    .fill(viewport([left]).wrap(false).style(self.style(MUTED)))
+                    .fixed(u16::from(width < self.cols), text(" "))
+                    .fixed(
+                        width,
+                        viewport([model]).wrap(false).style(self.style(MUTED)),
+                    ),
+            );
         }
         tail
     }
@@ -531,7 +680,7 @@ impl App for TerminalApp {
             .on_override(key(KeyCode::Esc), Msg::Escape)
             .on_override(key(KeyCode::Char('c')).ctrl(), Msg::Interrupt)
             .on_override(key(KeyCode::Char('d')).ctrl(), Msg::Eof)
-            .on_override(key(KeyCode::Char('s')).ctrl(), Msg::SaveModel)
+            .on_override(key(KeyCode::Char('s')).ctrl(), Msg::SaveChoice)
             .on_override(key(KeyCode::Char('a')).ctrl(), Msg::EditKey(KeyCode::Home))
             .on_override(key(KeyCode::Char('e')).ctrl(), Msg::EditKey(KeyCode::End))
             .on_override(key(KeyCode::Char('u')).ctrl(), Msg::KillLine(true))

@@ -211,8 +211,12 @@ pub fn write_committed_row<'a>(
     cells: impl IntoIterator<Item = &'a Cell>,
     cursor: &mut CursorState,
 ) {
-    out.push(b'\r');
+    // This row may still contain the live tail. Erase it before trimming
+    // trailing blanks: once scrolled out, sparse output cannot repair it.
+    // Reset first so BCE does not preserve the previous background color.
+    out.extend_from_slice(b"\r\x1b[0m\x1b[2K");
     cursor.col = 0;
+    cursor.style = Style::default();
 
     let cells: Vec<&Cell> = cells.into_iter().collect();
     // Note `Cell::default().style()`, not `Style::default()`: a cell
