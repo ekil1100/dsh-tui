@@ -1,0 +1,27 @@
+[package]
+name = "dsh-tui-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+eye_declare = { version = "=0.7.1", features = ["tokio"] }
+crossterm = "0.29"
+ratatui-core = "=0.1.2"
+futures = "0.3"
+napi = { version = "3", features = ["napi8", "tokio_rt"] }
+napi-derive = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-segmentation = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[patch.crates-io]
+eye_declare = { path = "vendor/eye_declare" }
+eye_declare_engine = { path = "vendor/eye_declare_engine" }

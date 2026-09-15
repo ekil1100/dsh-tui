@@ -1,0 +1,144 @@
+//! The application contract: Elm-shaped, with the timeline as the effect
+//! boundary.
+
+use eye_declare_engine::escape::CursorStyle;
+use futures_core::Stream;
+
+use crate::element::Element;
+use crate::input::Keymap;
+use crate::subscription::Subscriptions;
+use crate::task::{Effect, PersistTracker, Task, spawn_effect, spawn_once_effect};
+use crate::timeline::Timeline;
+
+/// An inline application. The implementing struct IS the model: `update`
+/// takes `&mut self`, `tail` takes `&self` — the borrow checker enforces
+/// the discipline.
+pub trait App: Sized {
+    /// Messages driving the app. Everything that happens becomes one.
+    type Msg;
+    /// What the run loop returns after [`Ctx::exit`].
+    type Output: Default;
+
+    /// One-time startup effects, run during runtime construction before
+    /// the first frame: push preamble blocks, spawn initial work, feed an
+    /// initial message through the model. Default: nothing.
+    ///
+    /// Async effects spawned here need an async driver, exactly as from
+    /// `update`; the sync [`run`](crate::run) rejects them.
+    fn init(&mut self, ctx: &mut Ctx<'_, Self>) {
+        let _ = ctx;
+    }
+
+    /// Handle a message: mutate the model, emit effects via `ctx`.
+    fn update(&mut self, msg: Self::Msg, ctx: &mut Ctx<'_, Self>);
+
+    /// Describe the live tail. Re-run every frame; borrows the model.
+    fn tail(&self) -> impl Element + '_;
+
+    /// Key bindings, rebuilt from the model each update so they can be
+    /// conditional on app state.
+    fn keymap(&self) -> Keymap<Self::Msg> {
+        Keymap::new()
+    }
+
+    /// Declarative recurring inputs, re-derived from the model each update
+    /// and diffed by the driver (see [`Subscriptions`]). Requires an async
+    /// driver.
+    fn subscriptions(&self) -> Subscriptions<Self::Msg> {
+        Subscriptions::new()
+    }
+
+    /// The hardware cursor shape, re-derived from the model each present
+    /// (like [`keymap`](App::keymap)): return the shape for the current
+    /// mode and the runtime emits changes as DECSCUSR. The shape is never
+    /// reset at teardown — an app that changes shapes should end on the
+    /// shape it wants to leave behind (usually `DefaultUserShape`).
+    fn cursor_style(&self) -> CursorStyle {
+        CursorStyle::DefaultUserShape
+    }
+
+    /// Called with the terminal dimensions at startup and after every
+    /// resize, before the accompanying repaint: return a message to feed
+    /// the new size into the model (e.g. to size a fixed-height tail).
+    /// Default: `None`, sizes are ignored.
+    fn on_resize(&self, width: u16, height: u16) -> Option<Self::Msg> {
+        let _ = (width, height);
+        None
+    }
+}
+
+/// Effect context handed to [`App::update`].
+///
+/// Committed output is an effect: [`push`](Ctx::push) renders the block
+/// immediately (so blocks may freely borrow from locals or the model) and
+/// the bytes join this update's output in order. Async work is an effect
+/// too: [`spawn`](Ctx::spawn) queues the stream for the driver and returns
+/// a cancel-on-drop [`Task`] to hold in the model.
+pub struct Ctx<'a, A: App> {
+    pub(crate) timeline: &'a mut Timeline,
+    pub(crate) output: &'a mut Vec<u8>,
+    pub(crate) effects: &'a mut Vec<Effect<A::Msg>>,
+    pub(crate) persists: &'a PersistTracker,
+    pub(crate) exit: Option<A::Output>,
+}
+
+impl<A: App> Ctx<'_, A> {
+    /// Commit a finished block above the live tail. Irreversible, like
+    /// `println!`: the block renders once at the current width and leaves
+    /// the program's world.
+    pub fn push(&mut self, block: impl Element) {
+        let bytes = self.timeline.push(block);
+        self.output.extend_from_slice(&bytes);
+    }
+
+    /// Spawn a stream of messages (the LLM-turn shape): each item feeds
+    /// back into [`App::update`]. The work starts when the driver drains
+    /// effects after this update returns, and stops when the stream ends
+    /// or the returned [`Task`] is dropped — hold it in the model, and
+    /// cancellation is `self.task = None`.
+    ///
+    /// Requires an async driver (the sync [`run`](crate::run) refuses apps
+    /// that spawn).
+    #[must_use]
+    pub fn spawn(&mut self, stream: impl Stream<Item = A::Msg> + Send + 'static) -> Task {
+        let (effect, task) = spawn_effect(stream);
+        self.effects.push(effect);
+        task
+    }
+
+    /// One-shot convenience over [`spawn`](Ctx::spawn): run a future,
+    /// deliver its output as a single message.
+    #[must_use]
+    pub fn perform(&mut self, future: impl Future<Output = A::Msg> + Send + 'static) -> Task {
+        let (effect, task) = spawn_once_effect(future);
+        self.effects.push(effect);
+        task
+    }
+
+    /// Fire-and-forget work the driver must not abandon: like
+    /// [`perform`](Ctx::perform) + [`Task::detach`], but tracked — the
+    /// driver waits for it at teardown before the run loop returns. For
+    /// effects with durability requirements (a database write, a file
+    /// save) where a quick exit would otherwise race the work against
+    /// process shutdown and silently lose it.
+    ///
+    /// No handle is returned: work that must complete is uncancellable by
+    /// definition. The future's message is delivered normally while the
+    /// app runs and dropped after it exits. Requires an async driver, like
+    /// [`spawn`](Ctx::spawn); the wait is bounded only if the driver's
+    /// options say so (see `RunOptions::persist_grace`).
+    pub fn persist(&mut self, future: impl Future<Output = A::Msg> + Send + 'static) {
+        let guard = self.persists.guard();
+        let (effect, task) = spawn_once_effect(async move {
+            let _guard = guard;
+            future.await
+        });
+        task.detach();
+        self.effects.push(effect);
+    }
+
+    /// End the run loop; it returns this value after teardown.
+    pub fn exit(&mut self, output: A::Output) {
+        self.exit = Some(output);
+    }
+}

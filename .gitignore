@@ -1,0 +1,7 @@
+node_modules/
+dist/
+native/target/
+native/*.node
+artifacts/
+*.tgz
+.env

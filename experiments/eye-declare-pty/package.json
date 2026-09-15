@@ -1,0 +1,8 @@
+{
+  "name": "dsh-eye-declare-pty-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "cargo build --locked && node --test --test-concurrency=1 test.mjs"
+  }
+}

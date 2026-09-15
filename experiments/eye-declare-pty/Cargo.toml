@@ -1,0 +1,13 @@
+[package]
+name = "eye-declare-pty-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eye_declare = { version = "=0.7.1", default-features = false, features = ["tokio"] }
+crossterm = "=0.29.0"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "signal", "sync"] }
