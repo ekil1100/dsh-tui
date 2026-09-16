@@ -13,9 +13,28 @@ class Model extends LlmAdapter {
     ];
   }
 
+  async resolveModel(provider, model, signal) {
+    if (process.env.DSH_TEST_MODEL_INFO_DELAY) {
+      await delay(Number(process.env.DSH_TEST_MODEL_INFO_DELAY), undefined, { signal });
+    }
+    const info = await super.resolveModel(provider, model, signal);
+    return model === 'reasoner' ? { ...info, reasoning: {
+      efforts: ['off', 'low', 'high', 'max'].map(id => ({ id, name: id })), defaultEffort: 'high',
+    } } : info;
+  }
+
   async *stream(options) {
     const prompt = options.messages.filter(message => message.source.kind === 'user').at(-1)
       ?.content.filter(block => block.type === 'text').map(block => block.text).join('') ?? '';
+    if (prompt === 'which-effort' || prompt === 'slow-effort') {
+      const text = `Effort used: ${options.reasoningEffort ?? 'default'}`;
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      if (prompt === 'slow-effort') await delay(1000, undefined, { signal: options.signal });
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
     if (prompt === 'reasoning') {
       const reasoning = 'PRIVATE_REASONING 中文😀\nNever display this block.';
       yield { type: 'block-start', index: 0, blockType: 'reasoning' };
@@ -27,6 +46,23 @@ class Model extends LlmAdapter {
       await delay(750, undefined, { signal: options.signal });
       yield { type: 'text-delta', index: 1, text: ' complete.' };
       yield { type: 'block-end', index: 1, block: { type: 'text', text: 'Visible answer complete.' } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
+    if (prompt === 'wrapped-preview' || prompt === 'stream-with-log') {
+      const text = '## STREAM_PREVIEW_TITLE\n\n**Summary** ' +
+        'A streamed paragraph 中文 must remain above the editor. '.repeat(12) +
+        '\n\n**Architecture** ' + 'The controller owns session state; 中文 stays in the preview. '.repeat(12) +
+        '\n\nSTREAM_PREVIEW_END';
+      const characters = Array.from(text);
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      for (let i = 0; i < characters.length; i += 12) {
+        yield { type: 'text-delta', index: 0, text: characters.slice(i, i + 12).join('') };
+        await delay(8, undefined, { signal: options.signal });
+      }
+      if (prompt === 'stream-with-log') process.stdout.write('LIVE_LOG_NOTICE\n');
+      await delay(700, undefined, { signal: options.signal });
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }

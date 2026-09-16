@@ -392,7 +392,7 @@ impl Engine {
             // A reflowing terminal must fit the rows below the cursor too.
             // xterm.js may leave CPR at its old screen row after those rows
             // grow and scroll, making the report point below the input.
-            let below = self.reflow_rows_after_cursor(new_width);
+            let below = self.reflow_rows_after_cursor(new_width, cpr_row);
             let latest = (self.terminal_height as u32).saturating_sub(below + 1);
             cpr_row = cpr_row.min(latest as u16);
         }
@@ -425,7 +425,7 @@ impl Engine {
         output
     }
 
-    fn reflow_rows_after_cursor(&self, width: u16) -> u32 {
+    fn reflow_rows_after_cursor(&self, width: u16, reported_row: u16) -> u32 {
         let Some(frame) = &self.prev_frame else {
             return 0;
         };
@@ -436,13 +436,25 @@ impl Engine {
         else {
             return 0;
         };
-        (first..=last)
-            .map(|row| {
-                (frame.content_width_of_row(row) as u32)
-                    .div_ceil(width.max(1) as u32)
-                    .max(1)
-            })
-            .sum()
+        let row_height = |row| {
+            (frame.content_width_of_row(row) as u32)
+                .div_ceil(width.max(1) as u32)
+                .max(1)
+        };
+        let mut below: u32 = (first..=last).map(row_height).sum();
+        let mut top = (self.terminal_height as u32).saturating_sub(below);
+        for row in first..=last {
+            let height = row_height(row);
+            // A stale CPR can point into a lower hard line that xterm
+            // truncates as its cursor line instead of reflowing. Do not
+            // count that line's speculative extra rows toward an erase.
+            if (top..top + height).contains(&(reported_row as u32)) {
+                below -= height - 1;
+                break;
+            }
+            top += height;
+        }
+        below
     }
 
     /// Physical rows between the region top and the cursor after the

@@ -3,6 +3,7 @@ import type {} from '@deepseek-ai/dsh-commands';
 
 export const SHORTCUTS = [
   'Enter: send · Esc: clear draft / stop work · Ctrl+D: exit when idle and empty',
+  'Shift+Tab: cycle reasoning effort for this session (applies to the next request)',
   'Ctrl+A/E: start/end · Ctrl+U/K/W: delete left/right/word · Up/Down: input history',
   'Paste: line breaks become spaces; Enter sends explicitly',
 ].join('\n');

@@ -11,6 +11,7 @@ pub mod escape;
 pub mod frame;
 #[cfg(feature = "test-util")]
 pub mod test_terminal;
+mod word_wrapper;
 pub mod wrap;
 
 pub use engine::Engine;

@@ -1,11 +1,34 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { ModelSelectionRef } from '@deepseek-ai/dsh-agent';
-import type {} from '@deepseek-ai/dsh-llm';
+import type { LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm';
+import type { CommandResult } from '@deepseek-ai/dsh-commands';
 import type {} from '@deepseek-ai/dsh-agent-default-model';
 import { TuiController } from './controller.js';
 
 /** The same mutable selection drives both prompt assembly and the visible footer. */
-export function registerModel(ctx: Context, selection: ModelSelectionRef, controller: TuiController, workspace: string): void {
+export function registerModel(
+  ctx: Context, selection: ModelSelectionRef, controller: TuiController, workspace: string,
+  reasoning: LlmModelReasoningInfo | undefined,
+): () => CommandResult {
+  // Reuse capabilities resolved when selecting the model; a shortcut needs no async command state.
+  const cycleEffort = (): CommandResult => {
+    const current = selection.current;
+    if (!current) throw new Error('The Agent has no model selection');
+    const efforts = reasoning?.efforts;
+    if (!efforts?.length) return { kind: 'error', text: `No reasoning effort choices are available for ${current.provider}/${current.model}.` };
+    const effective = current.reasoningEffort ?? reasoning?.defaultEffort;
+    const index = efforts.findIndex(effort => effort.id === effective);
+    const next = { ...current, reasoningEffort: efforts[(index + 1) % efforts.length]!.id };
+    selection.current = next;
+    controller.identity(next.provider, next.model, workspace, next.reasoningEffort);
+    return { kind: 'success' };
+  };
+  ctx.commands.register({
+    name: 'effort', description: 'Cycle reasoning effort for this session',
+    handler({ rawInput }) {
+      return rawInput.trim() ? { kind: 'error', text: 'Usage: /effort' } : cycleEffort();
+    },
+  });
   ctx.commands.register({
     name: 'model', description: 'Choose a model for this session', input: { hint: '[provider/model]' },
     async handler({ agent, rawInput, signal }) {
@@ -33,17 +56,19 @@ export function registerModel(ctx: Context, selection: ModelSelectionRef, contro
       const provider = slash < 0 ? current.provider : value.slice(0, slash);
       const model = slash < 0 ? value : value.slice(slash + 1);
       if (!provider || !model) return { kind: 'error', text: 'Both provider and model must be non-empty.' };
-      await ctx.llm.resolveModelInfo(provider, model, signal);
+      const info = await ctx.llm.resolveModelInfo(provider, model, signal);
       signal.throwIfAborted();
       const next = { provider, model,
         ...(provider === current.provider && model === current.model ? { reasoningEffort: current.reasoningEffort } : {}),
       };
       if (save) await ctx.agentDefaultModel.saveSelection(next);
       selection.current = next;
-      controller.identity(provider, model, workspace, next.reasoningEffort);
+      reasoning = info.reasoning;
+      controller.identity(provider, model, workspace, next.reasoningEffort ?? reasoning?.defaultEffort);
       return { kind: 'success', text: save ? `Saved default: ${provider}/${model} (all profiles)` : `Model: ${provider}/${model} (session only)` };
     },
   });
+  return cycleEffort;
 }
 
 async function catalog(ctx: Context, signal: AbortSignal) {

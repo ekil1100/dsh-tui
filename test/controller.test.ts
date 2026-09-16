@@ -5,10 +5,11 @@ import { TuiController } from '../src/controller.js';
 
 const attemptId = 'attempt-test' as LlmAttemptId;
 
-// Assertions retain their original text/order contract as entries gain semantic styling.
+// Read the transcript through its visible text, independent of semantic styling.
 function textView(controller: TuiController) {
   const snapshot = controller.snapshot();
-  return { ...snapshot, committed: snapshot.committed.map(entry => entry.text) };
+  return { ...snapshot, committed: snapshot.committed.map(entry => entry.text),
+    active: snapshot.active.map(entry => entry.text).join('\n') };
 }
 
 test('the footer projects the selected model and effort without inventing a provider default', () => {
@@ -105,8 +106,23 @@ test('cancellation preserves a partial reply and settles unfinished tools instea
   controller.session(session.append('turn/end', { turn: 0, reason: { kind: 'aborted', reason: { kind: 'user' } } }));
   expect(textView(controller)).toMatchObject({
     mode: 'idle', active: '',
-    committed: ['✗ slow · cancelled', 'Partial reply\n[incomplete]', 'Stopped.'],
+    committed: ['Partial reply\n[incomplete]', '✗ slow · cancelled', 'Stopped.'],
   });
+});
+
+test('an abandoned stream retains visible text and releases later notices before a new attempt', () => {
+  const controller = new TuiController();
+  controller.stream({ type: 'start', attemptId, revision: 1, turn: 0, step: 0 });
+  controller.stream({ type: 'chunk', attemptId, revision: 2, index: 0, time: 0,
+    chunk: { type: 'text-delta', index: 0, text: 'Partial reply' } });
+  controller.notice('External notice');
+  expect(textView(controller)).toMatchObject({ committed: [], active: 'Partial reply\nExternal notice' });
+  controller.stream({ type: 'end', attemptId, revision: 3, index: 1, outcome: { kind: 'abandoned' } });
+  expect(textView(controller)).toMatchObject({ committed: ['Partial reply\n[incomplete]', 'External notice'], active: '' });
+  controller.stream({ type: 'start', attemptId: 'retry' as LlmAttemptId, revision: 4, turn: 0, step: 0 });
+  controller.stream({ type: 'chunk', attemptId: 'retry' as LlmAttemptId, revision: 5, index: 0, time: 1,
+    chunk: { type: 'text-delta', index: 0, text: 'Retry reply' } });
+  expect(textView(controller)).toMatchObject({ committed: ['Partial reply\n[incomplete]', 'External notice'], active: 'Retry reply' });
 });
 
 test('an approval replaces ordinary input and empty Enter rejects by default', async () => {

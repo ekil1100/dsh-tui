@@ -53,6 +53,7 @@ export class TuiApplication {
   private sessions;
   private commandAbort?: AbortController;
   private commandTask?: Promise<void>;
+  private cycleEffort?: ReturnType<typeof registerModel>;
   private restoreOutput?: () => string[];
   private closingLogs: string[] = [];
   private workspace = process.cwd();
@@ -76,8 +77,9 @@ export class TuiApplication {
   private async createAgent(): Promise<ModelSelection> {
     const selection = this.ctx.agentDefaultModel.currentSelection();
     const preset = await this.ctx.agentPresets.resolve();
+    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model, this.creation.signal);
     this.creation.signal.throwIfAborted();
-    this.controller.identity(selection.provider, selection.model, this.workspace, selection.reasoningEffort);
+    this.controller.identity(selection.provider, selection.model, this.workspace, selection.reasoningEffort ?? info.reasoning?.defaultEffort);
     const sessionId = `session-${randomUUID()}` as SessionId;
     this.sessionId = sessionId;
     const current = () => !this.stopped && this.sessionId === sessionId;
@@ -93,7 +95,7 @@ export class TuiApplication {
         const modelSelection = { current: selection, assembled: undefined };
         agentCtx.inject(['commands', 'llm', 'agentDefaultModel', 'agentPresets', 'pluginInventory', 'dynamicCordisRunner'], commandCtx => {
           registerHelp(commandCtx);
-          registerModel(commandCtx, modelSelection, this.controller, this.workspace);
+          this.cycleEffort = registerModel(commandCtx, modelSelection, this.controller, this.workspace, info.reasoning);
           registerPreset(commandCtx, this.controller);
           registerExtensions(commandCtx, this.controller);
           commandCtx.commands.register({
@@ -155,6 +157,7 @@ export class TuiApplication {
 
   private detachSession(): void {
     this.sessionId = undefined;
+    this.cycleEffort = undefined;
     for (const dispose of this.sessionDisposers.splice(0)) dispose();
     this.controller.closeInteractions();
   }
@@ -211,20 +214,30 @@ export class TuiApplication {
       else if (event.type === 'interrupt' && event.mode === 'idle') void this.quit(130);
       return;
     }
+    if (event.type === 'effort') {
+      const cycle = this.cycleEffort;
+      if (!cycle || this.commandAbort || this.controller.snapshot().interaction) return;
+      this.update(() => {
+        const result = cycle();
+        if (result.kind === 'error') this.controller.notice(result.text, 'error');
+      });
+      return;
+    }
     if (event.type !== 'submit' || !agent) return;
     if (event.interactionId != null) {
       this.controller.answer(event.interactionId, event.text);
       return;
     }
-    if (!event.text.trim() || this.commandAbort || this.controller.snapshot().interaction) return;
-    this.update(() => this.controller.user(event.text));
-    if (event.text.startsWith('/')) {
+    const text = event.text;
+    if (!text.trim() || this.commandAbort || this.controller.snapshot().interaction) return;
+    this.update(() => this.controller.user(text));
+    if (text.startsWith('/')) {
       this.commandAbort = new AbortController();
       this.update(() => this.controller.command(true));
-      this.commandTask = this.runCommand(event.text, this.commandAbort.signal);
+      this.commandTask = this.runCommand(text, this.commandAbort.signal);
       return;
     }
-    const message = createUserMessage({ content: [{ type: 'text', text: event.text }], source: { kind: 'user' } });
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
     if (agent.status === 'running') agent.steer(message);
     else agent.followup(message);
   }
@@ -233,7 +246,7 @@ export class TuiApplication {
     try {
       const execution = await this.ctx.commands.execute(this.handle!.agent, line, [], signal);
       this.update(() => this.controller.notice(signal.aborted ? 'Command cancelled.' : execution
-        ? execution.result.text ?? 'Command completed.'
+        ? execution.result.text ?? ''
         : `Unknown or invalid command: ${line}`,
       !execution || execution.result.kind === 'error' ? 'error' : 'notice'));
       // The old command/done event must settle before its Agent is disposed.

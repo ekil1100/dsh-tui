@@ -44,11 +44,7 @@ name = "test_terminal_behavior"
 path = "tests/test_terminal_behavior.rs"
 
 [dependencies.ratatui-core]
-version = "0.1"
-
-[dependencies.ratatui-widgets]
-version = "0.3"
-features = ["unstable-rendered-line-info"]
+version = "0.1.2"
 
 [dependencies.unicode-width]
 version = "0.2"

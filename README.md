@@ -34,8 +34,9 @@ bun run dsh --profile tui --dump-config
 
 - 新建并持久化会话，连续多轮对话；`/new` 关闭旧会话后创建新上下文，不清除或重放终端历史。
 - pi 风格双横线输入区：输入从行首开始，不显示 `>` 提示符；状态嵌在上横线。目录行左侧为目录/分支，右侧为当前 preset 与动态 extension 数；底栏左侧为用量/必要操作提示，右侧为模型/effort，空闲时不显示 `/help`。主色采用低饱和雾蓝，effort 使用 pi 的深色主题配色；保留终端背景和字体，支持非空 `NO_COLOR`。
-- 流式阶段显示纯文本末尾预览，不显示 reasoning；状态按真实事件区分 `Thinking`（思考）、`Responding`（正文输出）与 `Working`（等待/工具执行），完成后回到 `Idle`。最终回答按基础 Markdown 定稿一次：标题、强调、有序/无序列表、引用、行内代码和代码块。用户输入与工具/日志内容保持字面文本。仅在思考、尚无正文时取消，不生成空的 `[incomplete]`；已有正文则保留并标记未完成。
-- 回答和工具终态进入真实终端历史；普通活动区最多 8 行，打开菜单时最多 16 行。所有候选位于**输入框下横线之外、目录与底栏上方**，正常窗口最多显示 8 项，上下键滚动，标题显示当前序号/总数；不进入备用屏幕。短窗口按高度减少候选，优先保留输入与下横线，省略装饰行；窄窗口从左侧省略模型名，优先保留末尾的 effort。
+- 正文随流式事件实时增长并渲染基础 Markdown：标题、强调、有序/无序列表、引用、行内代码和代码块；超出屏幕的内容自然进入真实终端滚动记录，不再裁成 3 行预览。定稿沿用已显示的正文，仅收尾，不重放全文或突然展开。不显示 reasoning；状态按真实事件区分 `Thinking`（思考）、`Responding`（正文输出）与 `Working`（等待/工具执行），完成后回到 `Idle`。用户输入与工具/日志保持字面文本。仅在思考、尚无正文时取消，不生成空的 `[incomplete]`；已有正文则原位保留并标记未完成。
+- 正文、工具和异步通知按出现顺序进入同一队列；较早内容未定稿时，后来的日志和 steering 输入也实时显示，但不越过它写入历史，避免跨屏正文被覆盖或重复。工具终态保持调用顺序；失败或被放弃的流会释放后续内容，不让队列永久阻塞。
+- 正文上方/下方布局由框架统一处理；底部编辑和状态区最多 5 行，打开菜单时最多 13 行，正文不受这个高度限制。所有候选位于**输入框下横线之外、目录与底栏上方**，正常窗口最多显示 8 项，上下键滚动，标题显示当前序号/总数；不进入备用屏幕。短窗口按高度减少候选，优先保留输入与下横线，省略装饰行；窄窗口从左侧省略模型名，优先保留末尾的 effort。
 - 运行时仍可编辑输入；提交走 `steer()`，空闲提交走 `followup()`。
 - 工具运行、完成和失败摘要，使用工具提供的 presentation；缺失或出错时使用通用标题。终端类结果附带 exit code / signal，不展开完整工具输出。
 - Slash commands 走 dsh 命令服务，未知命令不会进入模型上下文；输入 `/` 从当前 Agent 的真实注册表列出命令，支持筛选、补全和键盘选择。
@@ -61,7 +62,9 @@ bun run dsh --profile tui --dump-config
 | `xhigh` | 亮紫 | `#D183E8` |
 | `max` | 洋红 | `#FF5FFF` |
 
-未显式选择 effort 时显示 `default`，保留提供方默认行为，横线使用雾蓝主色；不把它误标成 `off`。其他 adapter 自定义 effort 保留原名、使用主色。本次只增加展示，不增加 effort 切换快捷键，也不会为了配色改写模型设置。不同模型切换时不沿用旧模型的 effort。
+底栏 `·` 后显示当前 effort：优先显示显式选择，否则读取该模型 adapter 的 `defaultEffort`（例如 DeepSeek 默认 `high`），横线同步着色。只有 adapter 未声明默认值时才显示 `default`，保留提供方默认行为，不伪造 `off` 或其他档位。其他 adapter 自定义 effort 保留原名、使用主色；展示默认值不会改写模型设置。不同模型切换时重新读取能力，不沿用旧模型的 effort。
+
+**Shift+Tab** 按当前模型 adapter 声明的顺序循环切换 effort（DeepSeek 为 `off → low → high → max → off`），不加入模型未声明的档位；也可执行 `/effort`。切换成功只原地更新底栏和边框，不追加 `Effort: …` 成功记录；快捷键不进入命令执行状态，不闪现 `Esc to cancel`。切换只影响当前会话、从下一次模型请求生效，不中断正在生成的请求，也不修改共享默认设置。草稿、光标和普通 Tab 补全保持不变，连续快速切换后仍可立即提交；列表选择、命令执行、审批或问题输入期间不响应此快捷键。没有可选 effort 的模型会明确提示，不修改当前选择。
 
 目录在启动和 `/new` 时读取：home 前缀缩写为 `~`，Git 分支显示为 `(branch)`；非仓库或 detached HEAD 不伪造分支名。底栏的 `↑` 是未缓存输入 token，`↓` 是输出，`R`/`W` 是缓存读取/写入；只累计当前会话最终消息中 adapter 实际上报的 usage，不把流式 usage 重复加总，未上报且空闲时左侧留空。`/new` 清零用量。暂不显示费用、上下文占比或自动压缩状态，不使用示例数字冒充真实数据。
 
@@ -72,6 +75,7 @@ bun run dsh --profile tui --dump-config
 | `/help` | 当前 Agent 可用命令与按键说明 |
 | `/model` | 显示当前/默认模型，打开可搜索的模型列表 |
 | `/model provider/model` | 验证并切换当前会话模型；省略 provider 时沿用当前 provider |
+| `/effort` | 按模型支持的档位循环切换 effort，等同 Shift+Tab；从下一次请求生效 |
 | `/preset` / `/preset id` | 搜索或直接选择 Agent preset；只允许在首次对话前切换 |
 | `/extensions` / `/extensions filter` | 搜索当前会话动态扩展与宿主/Preset 插件；Enter 查看详情，只读 |
 | `/new` | 空闲时 flush 并释放旧 Agent，创建新会话；重新读取默认模型与 preset |
@@ -92,6 +96,7 @@ dsh 已有命令直接从当前 Agent 的注册表使用，不重新实现；切
 
 | 场景 | 操作 |
 |---|---|
+| 普通输入（空闲或 Agent 运行） | Shift+Tab 循环切换本会话 effort |
 | 空闲 | Enter 提交；Esc / Ctrl+C 清空非空草稿 |
 | 空闲且输入为空 | Ctrl+D 退出 0；Ctrl+C 退出 130 |
 | Agent 运行 | Enter 追加 steering；Esc / Ctrl+C 停止工作 |
@@ -111,7 +116,7 @@ dsh 已有命令直接从当前 Agent 的注册表使用，不重新实现；切
 
 渲染、布局、Markdown 与 grapheme 编辑仍使用现成框架，不是自写 renderer，但不是完全未修改的 eye_declare 0.7.1。`native/vendor/` 保留两份源码补丁：
 
-- [引擎补丁](native/vendor/eye_declare_engine/README.md)：修正光标行截断被误算为重排、高度缩小后重绘清空历史，以及输入框下方内容重排导致光标报告漂移、候选残留的问题。长回答写入滚动历史前逐行清除旧活动区内容，避免空行/短行夹带预览和状态栏。空间不足时只滚动补足缺少的行；无法确认重排时宁可少擦留残影，不多擦历史。
+- [引擎补丁](native/vendor/eye_declare_engine/README.md)：修正光标行截断被误算为重排、高度缩小后重绘清空历史，以及输入框下方内容重排导致光标报告漂移、候选残留的问题。长回答写入滚动历史前逐行清除旧活动区内容，避免空行/短行夹带预览和状态栏；修正公共换行路径的中文/emoji 右边界溢出，避免连续流式输出覆盖输入边框。空间不足时只滚动补足缺少的行；无法确认重排时宁可少擦留残影，不多擦历史。
 - [Markdown 补丁](native/vendor/eye_declare/README.md)：补齐引用、编号列表与列表标记的无色样式。
 
 原始失败用例和两类光标行 reflow 设置均保留。未隐藏硬件光标、未进入备用屏幕、未重打已定稿内容。
@@ -122,7 +127,7 @@ dsh 已有命令直接从当前 Agent 的注册表使用，不重新实现；切
 - 自动测试使用真实 PTY + headless xterm，不能替代所有真实终端和中文输入法候选窗的人工验收。复合 ZWJ emoji 的真实字形仍未验收。
 - Linux、Windows、原生进程崩溃等尚未做完整验证；不要把正常退出检查理解为任意强制终止都能恢复。
 - 输出协调覆盖 Node streams；绕过它们直接写终端 fd 的第三方插件尚不支持。
-- 没有会话选择/恢复、附件、多行编辑器、PTY 工具全屏接管或自定义 TUI 组件扩展接口；复杂 Markdown 表格与代码语法高亮未验收，流式预览暂不做 Markdown 排版。
+- 没有会话选择/恢复、附件、多行编辑器、PTY 工具全屏接管或自定义 TUI 组件扩展接口；复杂 Markdown 表格与代码语法高亮未验收。已经滚出屏幕的正文不可回写；后续 Markdown 若反向修改先前内容（例如文末才给出的引用定义），不保证修正已滚出的样式。
 - 原生模块目前在安装时从源码构建；还没有各平台预编译 npm 包，也没有发布到 npm。构建通过原子替换发布 `.node`，不原地改写已加载的动态库；重新构建后需要重启 dsh 才会使用新版界面。
 
 ## 打包安装
@@ -145,7 +150,7 @@ bun run dsh plugin --profile tui install
 
 ## 开发与验证
 
-本机已通过：11 项 Controller 测试、45 项终端回归测试（含 7 个 effort、2 个 preset 子用例，共 54 项）、1 项打包安装/双会话与 preset 记录冷读测试、106 项组件单元测试、65 项引擎测试，以及 TypeScript 与 Rust fmt/clippy 检查。测试 adapter 不调用真实模型 API。
+本机已通过：12 项 Controller 测试、55 项终端回归测试（含 7 个 effort、2 个 preset 子用例，共 64 项）、1 项打包安装/双会话与 preset 记录冷读测试、106 项组件单元测试、68 项引擎测试，以及 TypeScript 与 Rust fmt/clippy 检查。测试 adapter 不调用真实模型 API。
 
 ```sh
 bun run test                # Controller behavior tests (Vitest)
@@ -174,7 +179,7 @@ src/startup.ts        参数与帮助
 src/application.ts    Agent、事件、命令和完整关闭流程
 src/controller.ts     有序会话投影与界面快照
 src/commands.ts       /help 与命令说明
-src/model-command.ts  模型验证、会话切换和显式保存默认
+src/model-command.ts  模型验证、会话切换、effort 循环和显式保存默认
 src/preset-command.ts Agent preset 的发现与合法选择
 src/extensions-command.ts 只读动态扩展与插件清单
 src/picker.ts         模型、Preset、Extension 共用的可取消选择器

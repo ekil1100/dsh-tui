@@ -26,7 +26,7 @@ export class TuiController {
   private usage?: { input: number; output: number; read: number; write: number };
   private commands: { name: string; description: string }[] = [];
   private nextSeq = 0;
-  private active = '';
+  private active?: Block;
   private activity: '' | 'thinking' | 'responding' = '';
   private textBlocks = new Map<number, string>();
   private commandActive = false;
@@ -76,18 +76,42 @@ export class TuiController {
   status(mode: 'idle' | 'running'): void { this.mode = mode; }
   command(active: boolean): void { this.commandActive = active; }
   notice(text: string, kind: TranscriptEntry['kind'] = 'notice'): void {
-    if (text) this.committed.push({ kind, text: cleanText(text) });
+    if (text) this.pending.push({ kind, text, done: true });
+    this.flush();
   }
   user(text: string): void { this.notice(`> ${text}`, 'user'); }
+
+  private settleAssistant(text: string): void {
+    if (this.active) {
+      this.active.text = text;
+      this.active.done = true;
+      this.active = undefined;
+    } else {
+      this.pending.push({ kind: 'assistant', text, done: true });
+    }
+  }
+
+  private flush(): void {
+    while (this.pending[0]?.done) {
+      const { kind, text } = this.pending.shift()!;
+      if (text) this.committed.push({ kind, text: cleanText(text) });
+    }
+  }
 
   stream(frame: AssistantStreamFrame): void {
     if (frame.type === 'start') {
       this.activity = '';
-      this.active = '';
       this.textBlocks.clear();
       return;
     }
-    if (frame.type === 'end') { this.activity = ''; return; }
+    if (frame.type === 'end') {
+      // Successful messages have already settled via the durable session event.
+      // Abandoned or failed attempts must not strand visible text or later notices.
+      if (this.active) this.settleAssistant(`${this.active.text}\n[incomplete]`);
+      this.activity = '';
+      this.flush();
+      return;
+    }
     const chunk = frame.chunk;
     if (chunk.type === 'block-start') {
       this.activity = chunk.blockType === 'reasoning' ? 'thinking' : chunk.blockType === 'text' ? 'responding' : '';
@@ -97,7 +121,11 @@ export class TuiController {
       this.activity = 'responding';
       const { index, text } = chunk;
       this.textBlocks.set(index, (this.textBlocks.get(index) ?? '') + text);
-      this.active = [...this.textBlocks].sort(([left], [right]) => left - right).map(([, text]) => text).join('');
+      if (!this.active) {
+        this.active = { kind: 'assistant', text: '', done: false };
+        this.pending.push(this.active);
+      }
+      this.active.text = [...this.textBlocks].sort(([left], [right]) => left - right).map(([, text]) => text).join('');
     }
   }
 
@@ -116,8 +144,7 @@ export class TuiController {
           this.usage.write += usage.cacheWriteTokens ?? 0;
         }
         const text = event.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('');
-        this.pending.push({ kind: 'assistant', done: true, text: text && event.data.interrupted ? `${text}\n[incomplete]` : text });
-        this.active = '';
+        this.settleAssistant(text && event.data.interrupted ? `${text}\n[incomplete]` : text);
         this.activity = '';
         break;
       }
@@ -169,8 +196,7 @@ export class TuiController {
           call.block.done = true;
           this.calls.delete(id);
         }
-        if (this.active) this.pending.push({ kind: 'assistant', done: true, text: `${this.active}\n[incomplete]` });
-        this.active = '';
+        if (this.active) this.settleAssistant(`${this.active.text}\n[incomplete]`);
         this.activity = '';
         if (reason.kind !== 'completed') {
           const text = reason.kind === 'aborted' ? 'Stopped.'
@@ -182,10 +208,7 @@ export class TuiController {
         break;
       }
     }
-    while (this.pending[0]?.done) {
-      const block = this.pending.shift()!;
-      if (block.text) this.notice(block.text, block.kind);
-    }
+    this.flush();
   }
 
   snapshot() {
@@ -198,7 +221,7 @@ export class TuiController {
       stats: usage ? [`↑${tokens(usage.input)}`, `↓${tokens(usage.output)}`,
         usage.read ? `R${tokens(usage.read)}` : '', usage.write ? `W${tokens(usage.write)}` : '',
       ].filter(Boolean).join(' ') : '',
-      active: cleanText([...this.pending.map(block => block.text), this.active].filter(Boolean).join('\n')),
+      active: this.pending.filter(entry => entry.text).map(({ kind, text }) => ({ kind, text: cleanText(text) })),
       activity: this.activity,
       mode: prompt ? 'interaction' as const : this.commandActive ? 'command' as const : this.mode,
       interaction: prompt ? { id: prompt.id, hint: oneLine(prompt.hint) } : null,

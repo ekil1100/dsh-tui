@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL('../../', import.meta.url));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 
 export async function startDsh(t, name = 'dsh', {
-  reflowCursorLine = false, env = {}, reasoningEffort, cwd = root,
+  reflowCursorLine = false, env = {}, reasoningEffort, model = 'test', cwd = root,
   command = `${quote(process.execPath)} ${quote(path.join(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js'))} --profile tui`,
 } = {}) {
   const home = mkdtempSync(path.join(tmpdir(), 'dsh-tui-'));
@@ -25,12 +25,12 @@ export async function startDsh(t, name = 'dsh', {
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@ekil9/dsh-tui'], patchReload: 'startup' } },
   }));
   writeFileSync(path.join(profile, 'cordis.patch.yml'), [
-    '- id: agent-default-model', '  config:', '    provider: test', '    model: test',
+    '- id: agent-default-model', '  config:', '    provider: test', `    model: ${JSON.stringify(model)}`,
     '- id: session-title-llm', '  disabled: true',
     '- insert:', '    - id: test-model', `      name: ${JSON.stringify(path.join(root, 'test/fixtures/model.mjs'))}`,
   ].join('\n'));
   if (reasoningEffort !== undefined) writeFileSync(path.join(home, 'settings.yaml'), JSON.stringify({
-    'agent-default-model': { provider: 'test', model: 'test', reasoningEffort },
+    'agent-default-model': { provider: 'test', model, reasoningEffort },
   }));
   const app = await startApp(t, {
     name, reflowCursorLine, cwd, command,

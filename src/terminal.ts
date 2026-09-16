@@ -3,7 +3,7 @@ import { oneLine } from './display-text.js';
 import type { PickerEvent } from './picker.js';
 import type { TuiController } from './controller.js';
 
-export type TerminalEvent = PickerEvent | { type: 'submit'; text: string; interactionId: string | null } | { type: 'eof' | 'escape' | 'interrupt'; mode: Snapshot['mode'] };
+export type TerminalEvent = PickerEvent | { type: 'submit'; text: string; interactionId: string | null } | { type: 'effort' } | { type: 'eof' | 'escape' | 'interrupt'; mode: Snapshot['mode'] };
 export type Snapshot = ReturnType<TuiController['snapshot']>;
 
 /** The production terminal and test capture implement the same small interface. */

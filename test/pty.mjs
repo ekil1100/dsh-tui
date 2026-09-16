@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync,
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import stripAnsi from 'strip-ansi';
 import { startApp, startDsh } from './support/pty.mjs';
 
 test('the built native addon loads in a fresh Node process', () => {
@@ -41,6 +42,161 @@ test('input starts at column zero without a prompt prefix and keeps a typed grea
   await app.input('\x04');
   await app.shellCheck();
   assert.equal(app.all().split('> > 中文😀ab').length - 1, 1);
+});
+
+test('the footer resolves adapter defaults at startup and after model changes without saving them', async t => {
+  const app = await startDsh(t, 'effort-default', { model: 'reasoner', env: { NO_COLOR: '' } });
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  assert.match(app.footer(), /\(test\) reasoner · high$/);
+  const buffer = app.terminal.buffer.normal;
+  assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY - 1).getCell(0).getFgColor(), 0xb294bb);
+  await app.input('/model test/flash\r');
+  await app.waitFor('Model: test/flash (session only)');
+  assert.match(app.footer(), /\(test\) flash · default$/);
+  await app.input('\x1b[Z');
+  await app.waitFor('No reasoning effort choices are available for test/flash.');
+  assert.match(app.footer(), /\(test\) flash · default$/);
+  await app.input('/model test/reasoner\r');
+  await app.waitFor('Model: test/reasoner (session only)');
+  assert.match(app.footer(), /\(test\) reasoner · high$/);
+  await app.input('\x1b[Z');
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · max'));
+  assert.equal(existsSync(path.join(app.home, 'settings.yaml')), false);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('Shift+Tab cycles supported efforts, updates requests and borders, and preserves the draft', async t => {
+  const app = await startDsh(t, 'effort-cycle', { model: 'reasoner', env: { NO_COLOR: '' } });
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · high'), 15000);
+  await app.input('中文😀ab\x1b[D');
+  for (const [effort, color] of [
+    ['max', 0xff5fff], ['off', 0x505050], ['low', 0x5f87af], ['high', 0xb294bb], ['max', 0xff5fff],
+  ]) {
+    await app.input('\x1b[Z');
+    await app.waitFor(() => app.footer().endsWith(`(test) reasoner · ${effort}`), 2000);
+    assert.equal(app.editor(), '中文😀ab');
+    const buffer = app.terminal.buffer.normal;
+    assert.equal(buffer.cursorX, 7);
+    assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY - 1).getCell(0).getFgColor(), color);
+    assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY + 1).getCell(0).getFgColor(), color);
+  }
+  await app.input('\x03which-effort\r');
+  await app.waitFor('Effort used: max');
+  assert.equal(existsSync(path.join(app.home, 'settings.yaml')), false);
+  assert.doesNotMatch(app.all(), /> \/effort/);
+  await app.input('/new\r');
+  await app.waitFor('New session:');
+  assert.match(app.footer(), /\(test\) reasoner · high$/);
+  await app.input('which-effort\r');
+  await app.waitFor('Effort used: high');
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('effort switches update in place without a command-state flash or appended notices', async t => {
+  const app = await startDsh(t, 'effort-in-place', {
+    model: 'reasoner', env: { DSH_TEST_MODEL_INFO_DELAY: '150' },
+  });
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · high'), 15000);
+  await app.input('draft中😀\x1b[D');
+  const rawStart = app.raw.length;
+  const buffer = app.terminal.buffer.normal;
+  const cursor = buffer.baseY + buffer.cursorY;
+  await app.input('\x1b[Z');
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · max'));
+  assert.deepEqual({
+    flashedCancel: /Esc\s+to\s+cancel/.test(stripAnsi(app.raw.slice(rawStart))),
+    appendedNotice: app.all().includes('Effort: max (session only; next request)'),
+  }, { flashedCancel: false, appendedNotice: false });
+  assert.equal(buffer.baseY + buffer.cursorY, cursor);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(buffer.cursorX, 7);
+  await app.input(`\x03which-effort${'\x1b[Z'.repeat(6)}\r`);
+  await app.waitFor('Effort used: low');
+  assert.match(app.footer(), /\(test\) reasoner · low$/);
+  assert.doesNotMatch(stripAnsi(app.raw.slice(rawStart)), /Esc\s+to\s+cancel|Effort:|Command\s+completed/);
+  await app.input('/effort\r');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.footer().endsWith('(test) reasoner · high'));
+  assert.doesNotMatch(app.all(), /Effort:|Command completed/);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('Shift+Tab during a response affects the next request without overwriting the saved effort', async t => {
+  const app = await startDsh(t, 'effort-running', { model: 'reasoner', reasoningEffort: 'low' });
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · low'), 15000);
+  const settings = readFileSync(path.join(app.home, 'settings.yaml'), 'utf8');
+  await app.input('slow-effort\r');
+  await app.waitFor(() => app.status().startsWith('─ Responding '));
+  const rawStart = app.raw.length;
+  await app.input('\x1b[Z');
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · high'));
+  assert.match(app.footer(), /^Esc to stop/);
+  assert.doesNotMatch(stripAnsi(app.raw.slice(rawStart)), /Esc\s+to\s+cancel|Effort:/);
+  await app.waitFor('Effort used: low');
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  await app.input('which-effort\r');
+  await app.waitFor('Effort used: high');
+  assert.equal(readFileSync(path.join(app.home, 'settings.yaml'), 'utf8'), settings);
+  await app.input('/new\r');
+  await app.waitFor('New session:');
+  assert.match(app.footer(), /\(test\) reasoner · low$/);
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('Shift+Tab keeps command completion separate and never changes effort inside modal input', async t => {
+  const app = await startDsh(t, 'effort-input-modes', { model: 'reasoner' });
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · high'), 15000);
+  await app.input('/fi\x1b[Z');
+  await app.waitFor(() => app.footer().endsWith('(test) reasoner · max'));
+  assert.equal(app.editor(), '/fi');
+  assert.match(app.status(), /^─ Commands /);
+  await app.input('\t');
+  assert.equal(app.editor().trimEnd(), '/fixture');
+  assert.doesNotMatch(app.all(), /Command ready/);
+  await app.input('\x03/model\r');
+  await app.waitFor(() => app.status().startsWith('─ Select model '));
+  await app.input('test\x1b[Z');
+  assert.equal(app.editor(), 'test');
+  assert.match(app.status(), /^─ Select model /);
+  assert.match(app.footer(), /\(test\) reasoner · max$/);
+  await app.input('\x1b');
+  await app.waitFor('Model selection cancelled.');
+  await app.input('/fixture wait\r');
+  await app.waitFor(() => app.status().startsWith('─ Command '));
+  await app.input('draft\x1b[Z');
+  assert.equal(app.editor(), 'draft');
+  assert.match(app.status(), /^─ Command /);
+  assert.match(app.footer(), /\(test\) reasoner · max$/);
+  await app.input('\x1b');
+  await app.waitFor('Command cancelled.');
+  await app.input('\x03approve\r');
+  await app.waitFor('Allow fixture_tool once?');
+  await app.input('n\x1b[Z');
+  assert.equal(app.editor(), 'n');
+  assert.match(app.status(), /^─ Input /);
+  assert.match(app.footer(), /\(test\) reasoner · max$/);
+  await app.input('\r');
+  await app.waitFor('Decision: rejected');
+  await app.input('/help\r');
+  await app.waitFor('Shift+Tab: cycle reasoning effort');
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('Shift+Tab reports models without effort choices without changing the draft or request', async t => {
+  const app = await startDsh(t, 'effort-unavailable');
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  await app.input('draft\x1b[Z');
+  await app.waitFor('No reasoning effort choices are available for test/test.');
+  assert.equal(app.editor(), 'draft');
+  assert.match(app.footer(), /\(test\) test · default$/);
+  await app.input('\x03which-effort\r');
+  await app.waitFor('Effort used: default');
+  await app.input('\x04');
+  await app.shellCheck();
 });
 
 test('pi-style effort borders enclose the editor above the path and right-aligned model', async t => {
@@ -264,6 +420,104 @@ test('Escape during thinking leaves no reasoning or empty incomplete answer and 
   await app.input('\x03recovered\r');
   await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('Reply: recovered'));
   await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('streamed Markdown reaches scrollback before completion and seals without a jump or replay', async t => {
+  const app = await startDsh(t, 'live-markdown', { env: { NO_COLOR: '' } });
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  await app.resize(125, 12);
+  await app.input('wrapped-preview\r');
+  await app.input('draft中😀\x1b[D');
+  await app.waitFor('STREAM_PREVIEW_END');
+  assert.match(app.status(), /^─ Responding /);
+  assert.match(app.all(), /^STREAM_PREVIEW_TITLE$/m, 'The start of the answer must already be readable before completion');
+  const buffer = app.terminal.buffer.normal;
+  const heading = Array.from({ length: buffer.length }, (_, y) => buffer.getLine(y))
+    .find(line => line.translateToString(true) === 'STREAM_PREVIEW_TITLE');
+  assert.ok(heading.getCell(0).isBold(), 'Streaming uses the final Markdown styling');
+  const cursor = buffer.baseY + buffer.cursorY;
+  for (const marker of ['STREAM_PREVIEW_TITLE', 'STREAM_PREVIEW_END']) {
+    assert.equal(app.all().split(marker).length - 1, 1);
+  }
+  assert.equal(app.all().replaceAll('\n', '').split('中文').length - 1, 24);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(buffer.cursorX, 7);
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  assert.equal(buffer.baseY + buffer.cursorY, cursor, 'Finalization must not append the answer again or move the input');
+  for (const marker of ['STREAM_PREVIEW_TITLE', 'STREAM_PREVIEW_END']) {
+    assert.equal(app.all().split(marker).length - 1, 1);
+  }
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(buffer.cursorX, 7);
+  await app.input('\x03\x04');
+  await app.shellCheck();
+});
+
+test('an asynchronous notice during a multi-screen stream remains visible without losing or replaying the answer', async t => {
+  const app = await startDsh(t, 'live-log');
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  await app.resize(125, 12);
+  await app.input('stream-with-log\r');
+  await app.waitFor('STREAM_PREVIEW_END');
+  await app.input('draft中😀\x1b[D');
+  assert.match(app.status(), /^─ Responding /);
+  assert.match(app.all(), /LIVE_LOG_NOTICE/, 'An asynchronous notice must be visible while the answer is still streaming');
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  for (const marker of ['STREAM_PREVIEW_TITLE', 'STREAM_PREVIEW_END', 'LIVE_LOG_NOTICE']) {
+    assert.equal(app.all().split(marker).length - 1, 1, `${marker} must appear exactly once`);
+  }
+  assert.equal(app.all().replaceAll('\n', '').split('中文').length - 1, 24);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.input('\x03\x04');
+  await app.shellCheck();
+});
+
+test('cancelling a multi-screen answer preserves the streamed text once and keeps the next draft', async t => {
+  const app = await startDsh(t, 'live-cancel');
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  await app.resize(125, 12);
+  await app.input('wrapped-preview\r');
+  await app.waitFor('STREAM_PREVIEW_END');
+  await app.input('draft中😀\x1b[D\x1b');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('Stopped.'));
+  for (const marker of ['STREAM_PREVIEW_TITLE', 'STREAM_PREVIEW_END', '[incomplete]', 'Stopped.']) {
+    assert.equal(app.all().split(marker).length - 1, 1, `${marker} must appear exactly once`);
+  }
+  assert.equal(app.all().replaceAll('\n', '').split('中文').length - 1, 24);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(app.terminal.buffer.normal.cursorX, 7);
+  await app.input('\x03recovered\r');
+  await app.waitFor(() => app.status().startsWith('─ Idle ') && app.all().includes('Reply: recovered'));
+  await app.input('\x04');
+  await app.shellCheck();
+});
+
+test('125-column streaming wraps wide words without overwriting borders or leaving preview fragments', async t => {
+  const app = await startDsh(t, 'stream-wide-edge');
+  await app.waitFor(() => app.status().startsWith('─ Idle '), 15000);
+  await app.resize(125, 25);
+  await app.input('wrapped-preview\r');
+  await app.input('draft中😀\x1b[D');
+  await app.waitFor('STREAM_PREVIEW_END');
+  assert.match(app.status(), /^─ Responding .*─$/);
+  assert.equal(app.editor(), 'draft中😀');
+  const buffer = app.terminal.buffer.normal;
+  const cursor = buffer.baseY + buffer.cursorY;
+  assert.equal(buffer.cursorX, 7);
+  assert.equal(buffer.getLine(cursor + 1).translateToString(true), '─'.repeat(125));
+  assert.match(buffer.getLine(cursor - 2).translateToString(true), /STREAM_PREVIEW_END/);
+  assert.match(app.footer(), /^Esc to stop .*\(test\) test · default$/);
+  await app.waitFor(() => app.status().startsWith('─ Idle '));
+  const history = Array.from({ length: buffer.baseY + buffer.cursorY - 1 }, (_, y) => buffer.getLine(y).translateToString(true)).join('\n');
+  assert.equal(history.split('STREAM_PREVIEW_TITLE').length - 1, 1);
+  assert.equal(history.split('STREAM_PREVIEW_END').length - 1, 1);
+  assert.equal(history.replaceAll('\n', '').split('中文').length - 1, 24);
+  assert.doesNotMatch(history, /─ (?:Working|Responding) |Esc to stop/);
+  assert.equal(app.editor(), 'draft中😀');
+  assert.equal(buffer.cursorX, 7);
+  await app.input('\x03\x04');
   await app.shellCheck();
 });
 

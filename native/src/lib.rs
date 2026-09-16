@@ -4,8 +4,9 @@ use std::thread::JoinHandle;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use eye_declare::{
-    App, Ctx, Element, ElementExt, Focus, FocusHandle, InputEvent, Keymap, MarkdownStyles, Task,
-    TextAreaState, col, driver_tokio, key, keymap, markdown, row, text, text_area, viewport,
+    AnyElement, App, Ctx, Element, ElementExt, Focus, FocusHandle, InputEvent, Keymap,
+    MarkdownStyles, Task, TextAreaState, col, driver_tokio, key, keymap, markdown, row, text,
+    text_area, viewport,
 };
 use napi::{Error, Result};
 use napi_derive::napi;
@@ -88,7 +89,7 @@ struct Entry {
 #[derive(Clone, Default, Deserialize)]
 struct Frame {
     committed: Vec<Entry>,
-    active: String,
+    active: Vec<Entry>,
     activity: String,
     mode: String,
     interaction: Option<Prompt>,
@@ -108,6 +109,7 @@ enum Msg {
     Edit(InputEvent),
     Submit,
     Complete,
+    CycleEffort,
     SaveChoice,
     Eof,
     Escape,
@@ -145,6 +147,54 @@ impl TerminalApp {
             Style::default().fg(color)
         } else {
             Style::default()
+        }
+    }
+
+    fn transcript(&self, entry: &Entry, streaming: bool) -> AnyElement<'static> {
+        let content = entry.text.clone();
+        match entry.kind {
+            EntryKind::User => {
+                let style = if self.color {
+                    self.style(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                text(content).style(style).pad_top(1).any()
+            }
+            EntryKind::Assistant => {
+                let styles = if self.color {
+                    MarkdownStyles {
+                        heading: self.style(ACCENT).add_modifier(Modifier::BOLD),
+                        code_inline: self.style(ACCENT),
+                        ..MarkdownStyles::default()
+                    }
+                } else {
+                    MarkdownStyles {
+                        base: Style::default(),
+                        code_inline: Style::default(),
+                        code_block: Style::default(),
+                        bold: Style::default(),
+                        italic: Style::default(),
+                        heading: Style::default(),
+                        table_border: Style::default(),
+                        table_header: Style::default(),
+                    }
+                };
+                markdown(content)
+                    .styles(styles)
+                    .streaming(streaming)
+                    .pad_top(1)
+                    .any()
+            }
+            EntryKind::Tool => text(content)
+                .style(if streaming {
+                    Style::default()
+                } else {
+                    self.style(Color::Green)
+                })
+                .any(),
+            EntryKind::Notice => text(content).any(),
+            EntryKind::Error => text(content).style(self.style(Color::Red)).any(),
         }
     }
 
@@ -267,44 +317,7 @@ impl App for TerminalApp {
                     }
                 }
                 for committed in frame.committed.drain(..) {
-                    match committed.kind {
-                        EntryKind::User => {
-                            let style = if self.color {
-                                self.style(ACCENT).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default()
-                            };
-                            ctx.push(text(committed.text).style(style).pad_top(1));
-                        }
-                        EntryKind::Assistant => {
-                            let styles = if self.color {
-                                MarkdownStyles {
-                                    heading: self.style(ACCENT).add_modifier(Modifier::BOLD),
-                                    code_inline: self.style(ACCENT),
-                                    ..MarkdownStyles::default()
-                                }
-                            } else {
-                                MarkdownStyles {
-                                    base: Style::default(),
-                                    code_inline: Style::default(),
-                                    code_block: Style::default(),
-                                    bold: Style::default(),
-                                    italic: Style::default(),
-                                    heading: Style::default(),
-                                    table_border: Style::default(),
-                                    table_header: Style::default(),
-                                }
-                            };
-                            ctx.push(markdown(committed.text).styles(styles).pad_top(1));
-                        }
-                        EntryKind::Tool => {
-                            ctx.push(text(committed.text).style(self.style(Color::Green)))
-                        }
-                        EntryKind::Notice => ctx.push(text(committed.text)),
-                        EntryKind::Error => {
-                            ctx.push(text(committed.text).style(self.style(Color::Red)))
-                        }
-                    }
+                    ctx.push(self.transcript(&committed, false));
                 }
                 self.frame = *frame;
             }
@@ -320,6 +333,14 @@ impl App for TerminalApp {
                 self.input.handle(&event);
             }
             Msg::Complete => self.complete(true),
+            Msg::CycleEffort => {
+                if self.frame.interaction.is_none()
+                    && self.frame.picker.is_none()
+                    && self.frame.mode != "command"
+                {
+                    let _ = self.events.send(json!({"type": "effort"}).to_string());
+                }
+            }
             Msg::SaveChoice => {
                 if self.frame.interaction.is_none() {
                     self.choose(true);
@@ -461,6 +482,9 @@ impl App for TerminalApp {
 
     fn tail(&self) -> impl Element + '_ {
         let mut tail = col();
+        for entry in &self.frame.active {
+            tail = tail.child(self.transcript(entry, true));
+        }
         let candidates = self.completions();
         let choices = self.choices();
         let picking = self.frame.picker.is_some() && self.frame.interaction.is_none();
@@ -470,7 +494,7 @@ impl App for TerminalApp {
             candidates.len()
         };
         let desired_menu_rows = item_count.min(8) as u16;
-        let height = self.rows.saturating_sub(1).clamp(1, 8 + desired_menu_rows);
+        let height = self.rows.saturating_sub(1).clamp(1, 5 + desired_menu_rows);
         // Preserve the input and its lower border before decorations in short terminals.
         let footer_rows = u16::from(height >= 4 || (desired_menu_rows == 0 && height > 1));
         let menu_rows = desired_menu_rows.min(if height >= 6 {
@@ -519,9 +543,6 @@ impl App for TerminalApp {
             .interaction
             .as_ref()
             .map_or(status, |prompt| prompt.hint.as_str());
-        if chrome > 3 {
-            tail = tail.child(viewport(self.frame.active.lines()).height(chrome - 3));
-        }
         if chrome > 1 {
             let total = if picking {
                 choices.len()
@@ -681,6 +702,7 @@ impl App for TerminalApp {
             .on_override(key(KeyCode::Char('c')).ctrl(), Msg::Interrupt)
             .on_override(key(KeyCode::Char('d')).ctrl(), Msg::Eof)
             .on_override(key(KeyCode::Char('s')).ctrl(), Msg::SaveChoice)
+            .on_override(key(KeyCode::BackTab).shift(), Msg::CycleEffort)
             .on_override(key(KeyCode::Char('a')).ctrl(), Msg::EditKey(KeyCode::Home))
             .on_override(key(KeyCode::Char('e')).ctrl(), Msg::EditKey(KeyCode::End))
             .on_override(key(KeyCode::Char('u')).ctrl(), Msg::KillLine(true))

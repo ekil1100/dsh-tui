@@ -1,69 +1,62 @@
 use ratatui_core::buffer::Buffer;
-use ratatui_core::layout::Rect;
-use ratatui_core::text::Text;
-use ratatui_widgets::paragraph::{Paragraph, Wrap};
+use ratatui_core::layout::{Alignment, Rect};
+use ratatui_core::text::{Line, Span, Text};
+use ratatui_core::widgets::Widget;
 
-/// Below this width the word wrapper is unsafe: at width 2 a multi-column
-/// grapheme mid-word (plain CJK does it — `"a佉b"`) makes ratatui's
-/// `WordWrapper` emit a line wider than the limit, and `Paragraph::render`
-/// then writes past the buffer edge (upstream bug, found by fuzzing).
-/// Under this width both measuring and rendering fall back to truncation,
-/// which is panic-free at any width.
-const MIN_WRAP_WIDTH: u16 = 3;
+use crate::word_wrapper::{LineComposer, WordWrapper};
 
-/// Compute how many terminal rows `text` occupies at `width` with word wrapping.
-///
-/// Uses ratatui's `Paragraph` with `Wrap { trim: false }` to match the
-/// rendering behavior of [`render_wrapped`], including its truncation
-/// fallback below [`MIN_WRAP_WIDTH`].
-pub fn wrapped_line_count(text: &Text<'_>, width: u16) -> u16 {
-    if width == 0 {
-        return 0;
-    }
-    if width < MIN_WRAP_WIDTH {
-        return text.lines.len() as u16;
-    }
-    let count = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width);
-    count as u16
+fn composer<'a>(text: &'a Text<'_>, width: u16, alignment: Alignment) -> impl LineComposer<'a> {
+    let lines = text.lines.iter().map(move |line| {
+        (
+            line.styled_graphemes(text.style),
+            line.alignment.unwrap_or(alignment),
+        )
+    });
+    WordWrapper::new(lines, width, false)
 }
 
-/// Render `text` word-wrapped into `area`, scrolled down by `scroll_rows`.
-///
-/// This is the framework's one wrap-render path: word wrap at the area
-/// width preserving leading whitespace, except below [`MIN_WRAP_WIDTH`],
-/// where lines truncate at the edge instead of feeding the word wrapper
-/// widths it cannot handle. [`wrapped_line_count`] measures identically,
-/// keeping the `height(width)` contract exact in both regimes.
+/// Measure using the same corrected word wrapper as [`render_wrapped`].
+pub fn wrapped_line_count(text: &Text<'_>, width: u16) -> u16 {
+    let mut lines = composer(text, width, Alignment::Left);
+    let mut count = 0u16;
+    while lines.next_line().is_some() {
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Render complete wrapped graphemes, preserving styles, alignment, and indentation.
+/// Ratatui still renders each line; the shared composer keeps wide glyphs inside it.
 pub fn render_wrapped(
     text: Text<'_>,
-    alignment: ratatui_core::layout::Alignment,
+    alignment: Alignment,
     scroll_rows: u16,
     area: Rect,
     buf: &mut Buffer,
 ) {
-    use ratatui_core::widgets::Widget;
-
-    if area.width == 0 || area.height == 0 {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
         return;
     }
-    let paragraph = Paragraph::new(text).alignment(alignment);
-    let paragraph = if area.width < MIN_WRAP_WIDTH {
-        paragraph
-    } else {
-        paragraph.wrap(Wrap { trim: false })
-    };
-    paragraph.scroll((scroll_rows, 0)).render(area, buf);
-}
-
-/// Create a `Paragraph` with word wrapping enabled (no trim).
-///
-/// Prefer [`render_wrapped`], which also guards the degenerate widths the
-/// word wrapper cannot handle; this constructor remains for callers that
-/// need the `Paragraph` itself.
-pub fn wrapping_paragraph<'a>(text: Text<'a>) -> Paragraph<'a> {
-    Paragraph::new(text).wrap(Wrap { trim: false })
+    let mut lines = composer(&text, area.width, alignment);
+    for _ in 0..scroll_rows {
+        if lines.next_line().is_none() {
+            return;
+        }
+    }
+    for y in area.top()..area.bottom() {
+        let Some(wrapped) = lines.next_line() else {
+            break;
+        };
+        let spans = wrapped
+            .graphemes
+            .iter()
+            .map(|g| Span::styled(g.symbol, g.style))
+            .collect::<Vec<_>>();
+        Line::from(spans)
+            .alignment(wrapped.alignment)
+            .render(Rect::new(area.x, y, area.width, 1), buf);
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +82,84 @@ mod tests {
     }
 
     #[test]
+    fn wide_word_moves_to_the_next_row_before_crossing_the_right_edge() {
+        let text = text_from("a 中文");
+        assert_eq!(wrapped_line_count(&text, 5), 2);
+    }
+
+    #[test]
+    fn wide_graphemes_stay_inside_rows_without_losing_text() {
+        use unicode_width::UnicodeWidthStr;
+
+        for source in [
+            "a 中文😀 a中文b e\u{301}".to_string(),
+            format!(
+                "**Summary** {}",
+                "A streamed paragraph 中文 must remain above the editor. ".repeat(12)
+            ),
+        ] {
+            for width in 2..=132 {
+                let text = text_from(&source);
+                let rows = wrapped_line_count(&text, width);
+                let area = Rect::new(0, 0, width, rows);
+                let mut buf = Buffer::empty(area);
+                render_wrapped(text, Alignment::Left, 0, area, &mut buf);
+                let mut visible = String::new();
+                for y in 0..rows {
+                    let mut x = 0;
+                    while x < width {
+                        let symbol = buf[(x, y)].symbol();
+                        let columns = symbol.width() as u16;
+                        assert!(
+                            x + columns <= width,
+                            "Wide glyph crosses row {y} at width {width}"
+                        );
+                        visible.push_str(symbol);
+                        x += columns.max(1);
+                    }
+                }
+                let compact = |value: &str| {
+                    value
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<String>()
+                };
+                assert_eq!(
+                    compact(&visible),
+                    compact(&source),
+                    "Text lost at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_scrolling_preserves_styles_alignment_and_adjacent_rows() {
+        use ratatui_core::style::{Color, Modifier, Style};
+
+        let style = Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD);
+        let text = Text::from(Line::from(vec![
+            Span::raw("a "),
+            Span::styled("中文", style),
+        ]));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        buf.set_string(0, 2, "GUARD", Style::default());
+        render_wrapped(text, Alignment::Right, 1, Rect::new(2, 1, 5, 1), &mut buf);
+        assert_eq!(buf[(3, 1)].symbol(), "中");
+        assert_eq!(buf[(5, 1)].symbol(), "文");
+        for x in [3, 5] {
+            assert_eq!(buf[(x, 1)].fg, Color::Blue);
+            assert!(buf[(x, 1)].modifier.contains(Modifier::BOLD));
+        }
+        for (x, ch) in "GUARD".chars().enumerate() {
+            assert_eq!(buf[(x as u16, 2)].symbol(), ch.to_string());
+        }
+        assert_eq!(buf[(7, 1)].symbol(), " ");
+    }
+
+    #[test]
     fn explicit_newlines_counted() {
         let text = text_from("line1\nline2\nline3");
         assert_eq!(wrapped_line_count(&text, 80), 3);
@@ -108,13 +179,9 @@ mod tests {
         assert_eq!(wrapped_line_count(&text, 0), 0);
     }
 
-    /// Found by fuzzing: at width 2 a multi-column grapheme mid-word
-    /// ("a佉b", or a Cf prepend cluster like "\u{604}<") drives
-    /// ratatui's word wrapper into an out-of-bounds buffer write. Below
-    /// MIN_WRAP_WIDTH rendering must truncate instead, and measurement
-    /// must agree with it.
+    /// The same fix handles the old width-2 overflow without truncating whole lines.
     #[test]
-    fn degenerate_widths_truncate_instead_of_wrapping() {
+    fn narrow_widths_wrap_without_crossing_the_buffer_edge() {
         use ratatui_core::buffer::Buffer;
         use ratatui_core::layout::{Alignment, Rect};
         use ratatui_core::text::Line;
@@ -128,12 +195,8 @@ mod tests {
                 render_wrapped(text.clone(), Alignment::Left, 0, area, &mut buf);
             }
         }
-        // The truncation fallback measures hard lines.
-        let text = Text::from(vec![
-            ratatui_core::text::Line::raw("one"),
-            ratatui_core::text::Line::raw("two"),
-        ]);
-        assert_eq!(wrapped_line_count(&text, 2), 2);
+        assert_eq!(wrapped_line_count(&text_from("a佉b"), 2), 3);
+        assert_eq!(wrapped_line_count(&text_from("one\ntwo"), 2), 4);
     }
 
     #[test]
